@@ -1,0 +1,8 @@
+# Fim de linha uniforme no repositório; scripts do Windows mantêm CRLF.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.webp binary
+*.woff2 binary

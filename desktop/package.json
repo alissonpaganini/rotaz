@@ -1,0 +1,59 @@
+{
+  "name": "rotaz-desktop",
+  "productName": "Rotaz",
+  "version": "1.0.0",
+  "description": "Rotaz: qualquer modelo no seu Claude Code.",
+  "author": "Rotaz",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win --x64 --publish never",
+    "dist:mac": "electron-builder --mac --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.0.0",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "dev.rotaz.app",
+    "productName": "Rotaz",
+    "copyright": "Rotaz, licença MIT",
+    "asar": false,
+    "directories": { "output": "dist", "buildResources": "build" },
+    "files": [
+      "main.js",
+      "preload.cjs",
+      "package.json",
+      "assets/**",
+      { "from": "../src", "to": "server/src" },
+      { "from": "../public", "to": "server/public" },
+      { "from": "..", "to": "server", "filter": ["LICENSE", "README.md"] }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico",
+      "artifactName": "Rotaz-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Rotaz",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["universal"] }],
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "artifactName": "Rotaz-${version}.${ext}"
+    },
+    "dmg": { "title": "Rotaz" },
+    "linux": { "target": ["AppImage"], "category": "Development" }
+  }
+}

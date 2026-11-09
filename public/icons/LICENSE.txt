@@ -1,0 +1,2 @@
+Ícones de provedores: @lobehub/icons-static-svg@1.98.0 (MIT), https://github.com/lobehub/lobe-icons
+As marcas pertencem aos seus donos e identificam cada provedor.

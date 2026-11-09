@@ -1,0 +1,14 @@
+{
+  "name": "rotaz",
+  "version": "1.0.0",
+  "description": "Gateway local OpenAI <-> Anthropic com painel de controle, para usar APIs de terceiros no Claude Code.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20.11" },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js --open",
+    "serve": "node src/index.js"
+  }
+}

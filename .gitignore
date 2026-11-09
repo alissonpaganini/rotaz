@@ -1,0 +1,12 @@
+# Dados de execução: configuração, chaves cifradas, chave mestra e registros. Nunca versionar.
+data/
+*.log
+
+# Dependências e instaladores gerados
+node_modules/
+desktop/node_modules/
+desktop/dist/
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
