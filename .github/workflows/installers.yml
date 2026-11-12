@@ -76,6 +76,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Só para ler o CHANGELOG.md: as notas da Release saem da seção da versão.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: instaladores
@@ -84,4 +87,16 @@ jobs:
       - name: Publicar Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" instaladores/* --repo "${{ github.repository }}" --title "Rotaz ${{ github.ref_name }}" --generate-notes
+        shell: bash
+        run: |
+          # Notas: a seção "## <versão>" do CHANGELOG.md; sem ela, as notas automáticas do GitHub.
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" 'index($0, "## " v " ") == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notas.md
+          if [ -s notas.md ]; then
+            echo "" >> notas.md
+            echo "**Lista completa de mudanças:** ${{ github.server_url }}/${{ github.repository }}/commits/${GITHUB_REF_NAME}" >> notas.md
+            notes=(--notes-file notas.md)
+          else
+            notes=(--generate-notes)
+          fi
+          gh release create "$GITHUB_REF_NAME" instaladores/* --repo "${{ github.repository }}" --title "Rotaz $GITHUB_REF_NAME" "${notes[@]}"

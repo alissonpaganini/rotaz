@@ -24,7 +24,7 @@ Cada alias público (`claude-*`) aponta para provedor, modelo real, URL base e c
 | Qualquer pessoa | **App instalável:** `Rotaz-<versão>-Windows-x64-Setup.exe` (Windows), `Rotaz-<versão>-macOS-universal.dmg` (macOS) ou `Rotaz-<versão>-Linux-x86_64.AppImage` (Linux). O nome de cada arquivo diz o sistema. Abre o painel numa janela própria e fica na bandeja do sistema. |
 | Quem usa terminal | **Código-fonte:** `npm start`, com Node 20.11 ou superior e nenhuma dependência para instalar. |
 
-Os dois rodam exatamente o mesmo gateway e o mesmo painel.
+Os dois rodam exatamente o mesmo gateway e o mesmo painel. O que mudou em cada versão está em [CHANGELOG.md](CHANGELOG.md); as notas de cada Release saem de lá.
 
 ### App instalável
 
