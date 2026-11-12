@@ -21,7 +21,7 @@ Cada alias público (`claude-*`) aponta para provedor, modelo real, URL base e c
 
 | Para quem | Como |
 | --- | --- |
-| Qualquer pessoa | **App instalável:** `Rotaz-<versão>-Windows-x64-Setup.exe` (Windows) ou `Rotaz-<versão>-macOS-universal.dmg` (macOS). O nome de cada arquivo diz o sistema. Abre o painel numa janela própria e fica na bandeja do sistema. |
+| Qualquer pessoa | **App instalável:** `Rotaz-<versão>-Windows-x64-Setup.exe` (Windows), `Rotaz-<versão>-macOS-universal.dmg` (macOS) ou `Rotaz-<versão>-Linux-x86_64.AppImage` (Linux). O nome de cada arquivo diz o sistema. Abre o painel numa janela própria e fica na bandeja do sistema. |
 | Quem usa terminal | **Código-fonte:** `npm start`, com Node 20.11 ou superior e nenhuma dependência para instalar. |
 
 Os dois rodam exatamente o mesmo gateway e o mesmo painel.
@@ -32,10 +32,10 @@ Os dois rodam exatamente o mesmo gateway e o mesmo painel.
 - **Primeiro acesso:** o app já abre na tela de criar a senha.
 - **Ao fechar a janela:** por padrão o app e o gateway continuam na bandeja (use **Sair do Rotaz** no menu da bandeja para encerrar). Em Configurações → Sistema e segurança, ou no menu da bandeja, dá para trocar para **Encerrar o app**.
 - **Iniciar com o sistema:** em Configurações ou no menu da bandeja; o app abre minimizado.
-- **Dados:** ficam em `%APPDATA%\Rotaz\data` (Windows) ou `~/Library/Application Support/Rotaz/data` (macOS).
-- **Chave mestra:** protegida pelo DPAPI no Windows e pelo Keychain no macOS.
+- **Dados:** ficam em `%APPDATA%\Rotaz\data` (Windows), `~/Library/Application Support/Rotaz/data` (macOS) ou `~/.config/Rotaz/data` (Linux).
+- **Chave mestra:** protegida pelo DPAPI no Windows, pelo Keychain no macOS e pelo Secret Service (GNOME Keyring ou KWallet) no Linux.
 - **Convivência com o terminal:** se uma versão de terminal já estiver rodando na mesma porta, o app abre esse painel em vez de iniciar um segundo gateway.
-- **Atualizações:** no Windows, o app baixa a versão nova das Releases do GitHub em segundo plano e instala ao reiniciar (pelo aviso, pelo menu da logo, pela bandeja ou ao fechar o app). No macOS e no terminal, o painel só avisa e mostra o link. Desligue em Configurações → Sistema e segurança → **Atualizações**; desligado, o Rotaz não consulta o GitHub. A consulta envia só o IP e a versão instalada.
+- **Atualizações:** no Windows, o app baixa a versão nova das Releases do GitHub em segundo plano e instala ao reiniciar (pelo aviso, pelo menu da logo, pela bandeja ou ao fechar o app). No macOS, no Linux e no terminal, o painel só avisa e mostra o link. Desligue em Configurações → Sistema e segurança → **Atualizações**; desligado, o Rotaz não consulta o GitHub. A consulta envia só o IP e a versão instalada.
 
 ### Gerar os instaladores
 
@@ -45,7 +45,7 @@ npm install
 npm run dist:win
 ```
 
-O `.exe` sai em `desktop/dist/`. O `.dmg` precisa ser gerado num Mac (`npm run dist:mac`) ou pelo GitHub Actions: o workflow `.github/workflows/installers.yml` gera os dois a cada tag `v*` ou manualmente, pela aba Actions.
+O `.exe` sai em `desktop/dist/`. O `.dmg` precisa ser gerado num Mac (`npm run dist:mac`) e o `.AppImage` num Linux (`npm run dist:linux`), ou os três pelo GitHub Actions: o workflow `.github/workflows/installers.yml` gera todos a cada tag `v*` ou manualmente, pela aba Actions.
 
 ### Assinatura
 
@@ -53,6 +53,7 @@ Sem certificado de código, os sistemas desconfiam do instalador:
 
 - **Windows:** o SmartScreen mostra "O Windows protegeu o computador". Clique em **Mais informações → Executar assim mesmo**.
 - **macOS:** clique com o botão direito no app → **Abrir**, ou permita em **Ajustes do Sistema → Privacidade e Segurança**.
+- **Linux:** dê permissão de execução ao AppImage (`chmod +x Rotaz-*.AppImage`). No Ubuntu 22.04 ou mais novo, se não abrir, instale o FUSE 2 (`libfuse2t64`; no 22.04, `libfuse2`). No GNOME, o ícone da bandeja precisa da extensão AppIndicator.
 
 Para distribuir sem esses avisos, você precisa de:
 

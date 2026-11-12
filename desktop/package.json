@@ -11,7 +11,8 @@
   "scripts": {
     "start": "electron .",
     "dist:win": "electron-builder --win --x64 --publish never",
-    "dist:mac": "electron-builder --mac --publish never"
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux AppImage --x64 --publish never"
   },
   "devDependencies": {
     "electron": "45.0.0",
@@ -58,6 +59,6 @@
       "artifactName": "Rotaz-${version}-macOS-universal.${ext}"
     },
     "dmg": { "title": "Rotaz" },
-    "linux": { "target": ["AppImage"], "category": "Development", "artifactName": "Rotaz-${version}-Linux-${arch}.${ext}" }
+    "linux": { "target": ["AppImage"], "category": "Development", "icon": "build/icon.png", "synopsis": "Qualquer modelo no seu Claude Code", "artifactName": "Rotaz-${version}-Linux-${arch}.${ext}" }
   }
 }

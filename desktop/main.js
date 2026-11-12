@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import updaterPkg from 'electron-updater'; // MIT, do mesmo projeto do electron-builder
 
@@ -18,6 +19,23 @@ const assets = path.join(here, 'assets');
 if (process.env.ROTAZ_USER_DATA) app.setPath('userData', process.env.ROTAZ_USER_DATA); // isolamento em testes
 const dataDir = process.env.ROTAZ_DATA ?? path.join(app.getPath('userData'), 'data');
 const startHidden = process.argv.includes('--hidden') || app.getLoginItemSettings().wasOpenedAsHidden;
+
+// Iniciar com o sistema. Windows e macOS: registro nativo do Electron. Linux: o Electron não tem esse registro,
+// então o app grava um atalho XDG em ~/.config/autostart (o padrão do GNOME, KDE, XFCE e outros).
+const linuxAutostart = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'autostart', 'rotaz.desktop');
+function setLoginItem(enabled) {
+  if (process.platform !== 'linux') { app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true, args: ['--hidden'] }); return; }
+  try {
+    if (!enabled) { fs.rmSync(linuxAutostart, { force: true }); return; }
+    // No AppImage, o executável real muda a cada abertura; APPIMAGE aponta para o arquivo que a pessoa baixou.
+    // Dentro das aspas do Exec, a especificação XDG pede barra invertida antes de " ` $ e \.
+    const exe = (process.env.APPIMAGE || process.execPath).replace(/(["`$\\])/g, '\\$1');
+    fs.mkdirSync(path.dirname(linuxAutostart), { recursive: true });
+    const entry = ['[Desktop Entry]', 'Type=Application', 'Name=Rotaz', `Exec="${exe}" --hidden`, 'X-GNOME-Autostart-enabled=true', 'Terminal=false', ''];
+    fs.writeFileSync(linuxAutostart, entry.join('\n'));
+  } catch { /* sem permissão na pasta: a opção fica desligada */ }
+}
+const loginItemOn = () => (process.platform === 'linux' ? fs.existsSync(linuxAutostart) : app.getLoginItemSettings().openAtLogin);
 
 let win = null;
 let tray = null;
@@ -90,7 +108,7 @@ async function startGateway() {
   const { setAutoStartHandler } = await import(pathToFileURL(path.join(serverRoot, 'src', 'autostart.js')).href);
   setAutoStartHandler({
     label: 'Iniciar com o sistema',
-    set: (enabled) => { app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true, args: ['--hidden'] }); buildTrayMenu(); },
+    set: (enabled) => { setLoginItem(enabled); buildTrayMenu(); },
   });
   const keySourceName = prepareMasterKey();
   const port = process.env.ROTAZ_PORT !== undefined ? Number(process.env.ROTAZ_PORT) : undefined;
@@ -127,7 +145,7 @@ async function startGateway() {
   const { port: actual } = instance.store.server;
   panelUrl = `http://127.0.0.1:${actual}/`;
   // O registro de inicialização segue o que está salvo no painel.
-  app.setLoginItemSettings({ openAtLogin: !!instance.store.server.autoStart, openAsHidden: true, args: ['--hidden'] });
+  setLoginItem(!!instance.store.server.autoStart);
 }
 
 function createWindow() {
@@ -323,8 +341,8 @@ function buildTrayMenu() {
     { label: T('Abrir Rotaz'), click: showWindow },
     { label: running, enabled: false },
     { type: 'separator' },
-    { label: T('Iniciar com o sistema'), type: 'checkbox', checked: app.getLoginItemSettings().openAtLogin, enabled: !!gateway,
-      click: (item) => { gateway.store.updateServer({ autoStart: item.checked }); app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true, args: ['--hidden'] }); } },
+    { label: T('Iniciar com o sistema'), type: 'checkbox', checked: loginItemOn(), enabled: !!gateway,
+      click: (item) => { gateway.store.updateServer({ autoStart: item.checked }); setLoginItem(item.checked); } },
     { label: T('Ao fechar a janela'), submenu: [
       { label: T('Manter na bandeja'), type: 'radio', checked: closeAction() === 'tray', click: () => setCloseAction('tray') },
       { label: T('Encerrar o Rotaz'), type: 'radio', checked: closeAction() === 'quit', click: () => setCloseAction('quit') },
