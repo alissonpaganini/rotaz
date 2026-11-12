@@ -29,6 +29,22 @@ export function resolveAlias(store, requested) {
 }
 
 /**
+ * Por que um alias não tem alvo, para o painel explicar e oferecer a ação certa.
+ * `reason`: 'no-default' | 'missing' | 'model-off' | 'provider-off' | 'no-key'. `provider`: o primeiro afetado.
+ */
+export function routeProblem(store, alias) {
+  if (!alias) return { reason: 'no-default', alias: null, provider: null };
+  const owners = [...store.providers].sort(byPriority).filter((p) => p.models.some((m) => m.alias === alias));
+  const info = (reason, p) => ({ reason, alias, provider: p ? { id: p.id, name: p.name } : null });
+  if (!owners.length) return info('missing');
+  const withModel = owners.filter((p) => p.models.some((m) => m.alias === alias && m.enabled));
+  if (!withModel.length) return info('model-off', owners[0]);
+  const off = withModel.find((p) => !p.enabled);
+  if (off) return info('provider-off', off);
+  return info('no-key', withModel[0]);
+}
+
+/**
  * Regras (o painel descreve exatamente isto):
  * - Alias desativado, ou sem provedor ativo com chave: nenhum alvo. Desativar nunca é contornado por fallback.
  * - Fallback desligado: só o provedor de maior prioridade para o alias (as chaves dele ainda se revezam).

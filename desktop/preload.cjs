@@ -15,4 +15,8 @@ contextBridge.exposeInMainWorld('rotazDesktop', {
   // Abertura animada: mostra só na primeira vez que o app abre.
   shouldShowSplash: () => ipcRenderer.invoke('rotaz:splash'),
   markSplashSeen: () => ipcRenderer.invoke('rotaz:splash', true),
+  // Atualização automática (Windows): estado, verificar agora e reiniciar para instalar.
+  updateState: () => ipcRenderer.invoke('rotaz:update'),
+  updateAction: (action) => ipcRenderer.invoke('rotaz:update', action),
+  onUpdate: (cb) => ipcRenderer.on('rotaz:update', (_e, state) => cb(state)),
 });

@@ -4,13 +4,14 @@ import path from 'node:path';
 import { shortId, randomToken, sha256 } from './crypto.js';
 import { ALIAS_RE, validateBaseUrl, validateHeaders, aliasCompat } from './security.js';
 import { LocalError, CODES } from './i18n.js';
+import { BUDGET_DEFAULTS, CURRENCIES, ACTIONS } from './budget.js';
 
 export const DEFAULTS = {
   version: 1,
   server: {
     host: '127.0.0.1', port: 8787, timeoutMs: 300000, maxBodyMB: 32,
     rateLimitPerMin: 600, maxConcurrent: 32, maxAttempts: 4,
-    logLevel: 'info', autoStart: false, openBrowser: true, gatewayEnabled: true,
+    logLevel: 'info', autoStart: false, openBrowser: true, gatewayEnabled: true, updateCheck: true,
   },
   routing: {
     defaultAlias: null, catchAll: true, fallbackEnabled: true,
@@ -21,10 +22,11 @@ export const DEFAULTS = {
   admin: { passHash: null },
   ui: { theme: 'auto', palette: 'lavanda', lang: 'auto', dashboard: null },
   keyCheck: null,
+  budget: null, // gasto e orçamento (src/budget.js); null = padrões
 };
 
 /** Quadros da visão geral que o painel sabe desenhar. O layout salvo só pode usar estes. */
-export const DASHBOARD_WIDGETS = ['route', 'success', 'stats', 'requestsHills', 'tokensHills', 'latencyHills', 'traffic', 'providers', 'recent', 'errors'];
+export const DASHBOARD_WIDGETS = ['route', 'success', 'spend', 'stats', 'requestsHills', 'tokensHills', 'latencyHills', 'traffic', 'providers', 'recent', 'errors'];
 
 function normalizeDashboard(list) {
   if (!Array.isArray(list) || list.length > DASHBOARD_WIDGETS.length) throw new Error('Layout da visão geral inválido.');
@@ -37,6 +39,12 @@ function normalizeDashboard(list) {
     return { id: w.id, span };
   });
 }
+
+const clampNum = (v, min, max, name) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max) throw new LocalError('{0} deve estar entre {1} e {2}.', name, min, max);
+  return n;
+};
 
 const clampInt = (v, min, max, name) => {
   const n = Number(v);
@@ -244,9 +252,16 @@ export class Store {
     const maxOutputTokens = input.maxOutputTokens ? clampInt(input.maxOutputTokens, 1, 2000000, 'Limite de saída') : null;
     // null = sem limite próprio (o gateway ainda aprende com os erros do provedor); 0 = nunca enviar imagens.
     const maxImages = input.maxImages === null || input.maxImages === undefined || input.maxImages === '' ? null : clampInt(input.maxImages, 0, 100, 'Limite de imagens');
+    // preço em dólares por 1 milhão de tokens; vazio = sem preço (o gasto desse modelo não é contado)
+    const price = (v, name) => (v === null || v === undefined || v === '' ? null : clampNum(v, 0, 10000, name));
+    const priceIn = price(input.priceIn, 'Preço de entrada');
+    const priceOut = price(input.priceOut, 'Preço de saída');
     const m = { id: existing?.id ?? shortId(), alias, upstream, displayName: String(input.displayName ?? '').trim().slice(0, 80) || alias,
-      enabled: input.enabled ?? existing?.enabled ?? true, maxOutputTokens, maxImages, reasoningEffort: effort, tokenParam };
+      enabled: input.enabled ?? existing?.enabled ?? true, maxOutputTokens, maxImages, reasoningEffort: effort, tokenParam, priceIn, priceOut };
+    const oldAlias = existing && existing.alias !== alias ? existing.alias : null;
     if (existing) Object.assign(existing, m); else p.models.push(m);
+    // Renomear leva junto as referências (padrão, níveis, reserva do orçamento) se nenhum outro modelo usa o nome antigo.
+    if (oldAlias && !this.aliases().includes(oldAlias)) this.#renameRoutes(oldAlias, alias);
     if (!this.routing.defaultAlias) this.routing.defaultAlias = alias;
     this.dropDanglingRoutes();
     return m;
@@ -257,7 +272,7 @@ export class Store {
     if (list.length > 500) throw new Error('No máximo 500 modelos por vez.');
     return this.transact(() => list.map((m) => {
       try {
-        return this.#upsertModel(providerId, { alias: m.alias, upstream: m.upstream, displayName: m.displayName, maxOutputTokens: m.maxOutputTokens, maxImages: m.maxImages, reasoningEffort: m.reasoningEffort, tokenParam: m.tokenParam });
+        return this.#upsertModel(providerId, { alias: m.alias, upstream: m.upstream, displayName: m.displayName, maxOutputTokens: m.maxOutputTokens, maxImages: m.maxImages, reasoningEffort: m.reasoningEffort, tokenParam: m.tokenParam, priceIn: m.priceIn, priceOut: m.priceOut });
       } catch (e) { throw new LocalError('{0}: {1}', String(m.alias || m.upstream).slice(0, 80), e); }
     }));
   }
@@ -267,7 +282,7 @@ export class Store {
     const p = this.provider(providerId);
     if (!p) throw new Error('Provedor não encontrado.');
     if (!Array.isArray(ids) || !ids.length) throw new Error('Selecione ao menos um modelo.');
-    const fields = ['enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam'].filter((f) => f in set);
+    const fields = ['enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam', 'priceIn', 'priceOut'].filter((f) => f in set);
     if (!fields.length) throw new Error('Nada para alterar.');
     this.transact(() => {
       for (const id of ids) {
@@ -300,11 +315,21 @@ export class Store {
   }
 
   aliases() { return [...new Set(this.c.providers.flatMap((p) => p.models.map((m) => m.alias)))]; }
+  #renameRoutes(from, to) {
+    const r = this.routing;
+    if (r.defaultAlias === from) r.defaultAlias = to;
+    for (const t of Object.keys(r.tiers)) if (r.tiers[t] === from) r.tiers[t] = to;
+    if (this.c.budget?.fallbackAlias === from) this.c.budget.fallbackAlias = to;
+  }
+
   dropDanglingRoutes() {
     const all = new Set(this.aliases());
     const r = this.routing;
     if (r.defaultAlias && !all.has(r.defaultAlias)) r.defaultAlias = this.aliases()[0] ?? null;
     for (const t of Object.keys(r.tiers)) if (r.tiers[t] && !all.has(r.tiers[t])) r.tiers[t] = null;
+    // o modelo de reserva do orçamento sumiu: volta a só avisar
+    const b = this.c.budget;
+    if (b?.fallbackAlias && !all.has(b.fallbackAlias)) { b.fallbackAlias = null; if (b.action === 'switch') b.action = 'alert'; }
   }
 
   // ---- configurações ----
@@ -318,6 +343,32 @@ export class Store {
     if (input.fallbackEnabled !== undefined) next.fallbackEnabled = !!input.fallbackEnabled;
     for (const t of ['opus', 'sonnet', 'haiku']) if (input.tiers?.[t] !== undefined) next.tiers[t] = check(input.tiers[t]);
     this.transact(() => { this.c.routing = next; });
+  }
+
+  get budget() { return { ...BUDGET_DEFAULTS, ...this.c.budget }; }
+  updateBudget(input) {
+    const b = this.budget;
+    const next = { ...b };
+    if (input.currency !== undefined) {
+      if (!CURRENCIES.includes(input.currency)) throw new Error('Moeda inválida.');
+      next.currency = input.currency;
+    }
+    if (input.rate !== undefined) next.rate = clampNum(input.rate, 0.0001, 100000, 'Cotação');
+    if (next.currency === 'USD') next.rate = 1;
+    if (input.daily !== undefined) next.daily = clampNum(input.daily || 0, 0, 10000000, 'Limite diário');
+    if (input.monthly !== undefined) next.monthly = clampNum(input.monthly || 0, 0, 10000000, 'Limite mensal');
+    if (input.warnAt !== undefined) next.warnAt = clampInt(input.warnAt, 1, 99, 'Aviso');
+    if (input.action !== undefined) {
+      if (!ACTIONS.includes(input.action)) throw new Error('Ação inválida.');
+      next.action = input.action;
+    }
+    if (input.fallbackAlias !== undefined) {
+      if (input.fallbackAlias && !this.aliases().includes(input.fallbackAlias)) throw new LocalError('Alias desconhecido: {0}', String(input.fallbackAlias).slice(0, 70));
+      next.fallbackAlias = input.fallbackAlias || null;
+    }
+    if (next.action === 'switch' && !next.fallbackAlias) throw new Error('Escolha o modelo para onde os pedidos vão quando o limite for atingido.');
+    this.transact(() => { this.c.budget = next; });
+    return next;
   }
 
   updateServer(input) {
@@ -340,6 +391,7 @@ export class Store {
     if (input.autoStart !== undefined) next.autoStart = !!input.autoStart;
     if (input.openBrowser !== undefined) next.openBrowser = !!input.openBrowser;
     if (input.gatewayEnabled !== undefined) next.gatewayEnabled = !!input.gatewayEnabled;
+    if (input.updateCheck !== undefined) next.updateCheck = !!input.updateCheck;
     this.transact(() => { Object.assign(this.c.server, next); });
   }
 

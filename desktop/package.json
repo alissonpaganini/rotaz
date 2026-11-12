@@ -1,7 +1,7 @@
 {
   "name": "rotaz-desktop",
   "productName": "Rotaz",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Rotaz: qualquer modelo no seu Claude Code.",
   "author": "Rotaz",
   "license": "MIT",
@@ -17,12 +17,16 @@
     "electron": "45.0.0",
     "electron-builder": "26.18.0"
   },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
   "build": {
     "appId": "dev.rotaz.app",
     "productName": "Rotaz",
     "copyright": "Rotaz, licença MIT",
     "asar": false,
     "directories": { "output": "dist", "buildResources": "build" },
+    "publish": { "provider": "github", "owner": "alissonpaganini", "repo": "rotaz", "releaseType": "release" },
     "files": [
       "main.js",
       "preload.cjs",
@@ -35,7 +39,7 @@
     "win": {
       "target": [{ "target": "nsis", "arch": ["x64"] }],
       "icon": "build/icon.ico",
-      "artifactName": "Rotaz-Setup-${version}.${ext}"
+      "artifactName": "Rotaz-${version}-Windows-x64-Setup.${ext}"
     },
     "nsis": {
       "oneClick": true,
@@ -51,9 +55,9 @@
       "target": [{ "target": "dmg", "arch": ["universal"] }],
       "category": "public.app-category.developer-tools",
       "hardenedRuntime": true,
-      "artifactName": "Rotaz-${version}.${ext}"
+      "artifactName": "Rotaz-${version}-macOS-universal.${ext}"
     },
     "dmg": { "title": "Rotaz" },
-    "linux": { "target": ["AppImage"], "category": "Development" }
+    "linux": { "target": ["AppImage"], "category": "Development", "artifactName": "Rotaz-${version}-Linux-${arch}.${ext}" }
   }
 }

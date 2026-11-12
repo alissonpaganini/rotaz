@@ -9,6 +9,7 @@ import { SSEParser, safeParse, parseUpstreamError, toAnthropicError, toOpenAIErr
 import { TranslationError } from './translate/openai-to-anthropic.js';
 import { redact } from './security.js';
 import { LocalError, K, tr, resolveLang } from './i18n.js';
+import { costOf } from './budget.js';
 
 export class BodyError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
@@ -53,7 +54,7 @@ export function retryAfterMs(header, message) {
   return 10000;
 }
 
-export function createGateway({ store, metrics, log, limiter }) {
+export function createGateway({ store, metrics, log, limiter, budget }) {
   const pool = new KeyPool();
   const inflight = { n: 0 };
   const learnedImages = new Map(); // modelId -> limite aprendido com o erro do provedor (em memória)
@@ -159,10 +160,23 @@ export function createGateway({ store, metrics, log, limiter }) {
     const bad = validate(proto, body);
     if (bad) return sendError(res, proto, 400, bad);
 
-    const route = buildRoute(store, body.model);
+    let route = buildRoute(store, body.model);
+    // Orçamento estourado: bloqueia ou manda tudo para o modelo de reserva, conforme a configuração.
+    const spend = budget?.state();
+    if (spend?.over && spend.action === 'block') {
+      const msg = K('O limite de gastos do Rotaz foi atingido. Aumente o limite ou mude a ação em Configurações, no painel.');
+      metrics.record({ id, proto, stream: !!body.stream, alias: route.alias ?? String(body.model).slice(0, 80), via: 'budget', ms: 0, status: 402, error: msg, cost: 0 });
+      return sendError(res, proto, 402, msg, { 'x-should-retry': 'false' });
+    }
+    if (spend?.over && spend.action === 'switch' && spend.fallbackAlias && route.alias !== spend.fallbackAlias) {
+      const alt = buildRoute(store, spend.fallbackAlias);
+      if (alt.targets.length) route = { ...alt, via: 'budget', targets: alt.targets.map((t, i) => (i === 0 ? { ...t, via: 'budget' } : t)) };
+    }
     const base = { id, proto, stream: !!body.stream, alias: route.alias ?? String(body.model).slice(0, 80), via: route.via };
     const finish = (e) => {
-      metrics.record({ ...base, ms: Date.now() - started, ...e });
+      const { model, ...rest } = e;
+      metrics.record({ ...base, ms: Date.now() - started, ...rest, cost: model ? costOf(model, e.input ?? 0, e.output ?? 0) : null });
+      budget?.check();
       log.info(`${id} ${proto} ${body.stream ? 'stream' : 'sync'} ${String(body.model).slice(0, 60)} -> ${e.providerName ?? '-'}/${e.upstream ?? '-'} ${e.status} ${Date.now() - started}ms`);
     };
 
@@ -240,7 +254,7 @@ export function createGateway({ store, metrics, log, limiter }) {
         }
 
         if (up.status >= 200 && up.status < 300) {
-          const meta = { providerId: p.id, providerName: p.name, upstream: m.upstream, ttfb: Date.now() - started, via: target.via };
+          const meta = { providerId: p.id, providerName: p.name, upstream: m.upstream, ttfb: Date.now() - started, via: target.via, model: m };
           res.setHeader('x-gateway-provider', encodeURIComponent(p.name));
           res.setHeader('x-gateway-route', target.via);
           if (body.stream) {

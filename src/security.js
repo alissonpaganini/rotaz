@@ -1,5 +1,6 @@
 // Barreiras de segurança: SSRF, validação de entrada, redação de segredos e rate limiting.
 import net from 'node:net';
+import { blockedTerms } from '../public/alias.js';
 import dns from 'node:dns';
 import { LocalError } from './i18n.js';
 
@@ -133,13 +134,10 @@ export class LoginGuard {
   ok(ip) { this.f.delete(ip); }
 }
 
-export const ALIAS_RE = /^claude-[a-z0-9][a-z0-9._-]{0,62}$/;
-
-// Lista extraída do Claude Desktop 4.16336 (validador `Mo` do app.asar). Ids que a contenham
-// são descartados do seletor do Desktop, mesmo com prefixo `claude-`. O CLI não aplica esse filtro.
-const DESKTOP_DENY = /ark-code|astron|command-r|deepseek|doubao|gemini|gemma|glm|gpt|grok|hermes|hy3|kimi|lfm|\bling\b|llama|longcat|mimo|minimax|mistral|mixtral|moonshot|nemotron|openai|phi-|qianfan|qwen|tc-code|\bunic\b|yi-|stepfun|step-3|seed-|bytedance|hunyuan|granite|amazon\.nova|nova-|devstral|ministral|ernie|codex|arcee|trinity|abab|phi\d|\bk2\.|\bm2\.|jamba|arctic|solar|mercury|zamba|kat-coder|\bds-|dpsk/;
+// Regras de nome do Claude Code e do Claude Desktop: um só módulo para o painel e o servidor (public/alias.js).
+export { ALIAS_RE } from '../public/alias.js';
+/** Onde o alias aparece: `cli` (Claude Code) e `desktop` (seletor do Claude Desktop), com os termos que o Desktop esconde. */
 export function aliasCompat(alias) {
-  const a = String(alias).toLowerCase();
-  const m = DESKTOP_DENY.exec(a);
-  return { cli: /(claude|anthropic)/i.test(a), desktop: !m, blockedBy: m ? m[0] : null };
+  const blocked = blockedTerms(alias);
+  return { cli: /(claude|anthropic)/i.test(String(alias)), desktop: !blocked.length, blockedBy: blocked[0] ?? null, blocked };
 }

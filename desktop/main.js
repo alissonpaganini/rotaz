@@ -6,6 +6,9 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import updaterPkg from 'electron-updater'; // MIT, do mesmo projeto do electron-builder
+
+const { autoUpdater } = updaterPkg;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // Empacotado, o servidor é copiado para ./server; em desenvolvimento, usa o repositório (pasta acima).
@@ -82,6 +85,7 @@ async function startGateway() {
   const { createServer } = await import(pathToFileURL(path.join(serverRoot, 'src', 'index.js')).href);
   i18n = await import(pathToFileURL(path.join(serverRoot, 'src', 'i18n.js')).href);
   // "Automático" no app = idioma do sistema operacional, como o Windows ou o macOS informam
+  process.env.ROTAZ_VERSION = app.getVersion(); // a tela Sobre e os backups mostram a versão do app
   if (!process.env.ROTAZ_LANG) process.env.ROTAZ_LANG = i18n.detect([...(app.getPreferredSystemLanguages?.() ?? []), app.getLocale()]);
   const { setAutoStartHandler } = await import(pathToFileURL(path.join(serverRoot, 'src', 'autostart.js')).href);
   setAutoStartHandler({
@@ -106,7 +110,17 @@ async function startGateway() {
   if (prefs.closeAction === undefined && ['tray', 'quit'].includes(instance.store.server.closeAction)) savePrefs({ closeAction: instance.store.server.closeAction });
   // Mudanças feitas pelo painel (ex.: iniciar com o sistema) refletem na hora no menu da bandeja.
   const update = instance.store.updateServer.bind(instance.store);
-  instance.store.updateServer = (input) => { const r = update(input); buildTrayMenu(); return r; };
+  instance.store.updateServer = (input) => { const r = update(input); buildTrayMenu(); autoUpdater.autoInstallOnAppQuit = updatesEnabled(); return r; };
+  // Orçamento: avisa uma vez por período ao chegar perto do limite e ao atingi-lo.
+  instance.budget.onAlert(({ period, level, spent, limit, currency, action }) => {
+    const fmt = (v) => new Intl.NumberFormat(lang(), { style: 'currency', currency }).format(v);
+    const amount = period === 'day' ? T('Hoje: {0} de {1}.', fmt(spent), fmt(limit)) : T('Este mês: {0} de {1}.', fmt(spent), fmt(limit));
+    if (level === 'warn') return showNotice(T('Gasto perto do limite'), amount);
+    const what = action === 'block' ? T('Os pedidos do Claude Code estão sendo recusados até o fim do período.')
+      : action === 'switch' ? T('Os pedidos estão indo para o modelo de reserva até o fim do período.')
+      : T('Os pedidos continuam normalmente; só o aviso está ativo.');
+    showNotice(T('Limite de gastos atingido'), `${amount} ${what}`);
+  });
   // Trocar o idioma no painel traduz a bandeja na hora.
   const updateUi = instance.store.updateUi.bind(instance.store);
   instance.store.updateUi = (input) => { const r = updateUi(input); buildTrayMenu(); return r; };
@@ -227,6 +241,11 @@ function trayNotice() {
   const content = gateway?.store.server.gatewayEnabled === false
     ? T('O app segue na bandeja, com o gateway desligado. Clique no ícone para abrir ou use Sair do Rotaz para encerrar.')
     : T('O gateway segue funcionando na bandeja. Clique no ícone para abrir ou use Sair do Rotaz para encerrar.');
+  showNotice(title, content);
+}
+
+/** Notificação do sistema com o ícone do Rotaz; se o sistema recusar, o balão da bandeja (Windows). */
+function showNotice(title, content) {
   const icon = nativeImage.createFromPath(path.join(assets, 'icon.png'));
   const balloon = () => { if (process.platform === 'win32' && tray) tray.displayBalloon({ title, content, icon, largeIcon: false, noSound: true }); };
   if (!Notification.isSupported()) { debug('notificação não suportada: balão'); balloon(); return; }
@@ -245,10 +264,62 @@ function debug(msg) {
   try { fs.appendFileSync(path.join(app.getPath('userData'), 'notice-debug.log'), `${new Date().toISOString()} ${msg}\n`); } catch { /* ignora */ }
 }
 
+// ---------- atualização automática ----------
+// No Windows, o app instalado baixa a versão nova das Releases do GitHub em segundo plano e instala ao reiniciar
+// (o instalador confere o sha512 publicado com a Release). No macOS, sem assinatura da Apple, não há instalação
+// automática: o painel só avisa (src/updates.js). Tudo respeita a opção "Atualizações" em Configurações.
+const upd = { mode: 'none', status: 'idle', current: app.getVersion(), version: null, percent: 0, error: null, checkedAt: null };
+const updatesEnabled = () => (gateway ? gateway.store.server.updateCheck !== false : true);
+function setUpd(patch) {
+  Object.assign(upd, patch);
+  if (win && !win.isDestroyed()) win.webContents.send('rotaz:update', { ...upd });
+}
+function checkUpdates() {
+  if (upd.mode !== 'auto' || !updatesEnabled() || ['checking', 'downloading', 'ready'].includes(upd.status)) return;
+  autoUpdater.checkForUpdates().catch(() => { /* o evento 'error' já registra */ });
+}
+function setupUpdater() {
+  if (process.platform !== 'win32' || !app.isPackaged || process.env.ROTAZ_NO_UPDATER) return;
+  upd.mode = 'auto';
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = updatesEnabled();
+  autoUpdater.logger = null;
+  autoUpdater.on('checking-for-update', () => setUpd({ status: 'checking', error: null }));
+  autoUpdater.on('update-not-available', () => setUpd({ status: 'none', checkedAt: Date.now() }));
+  autoUpdater.on('update-available', (info) => setUpd({ status: 'downloading', version: info.version, percent: 0, checkedAt: Date.now() }));
+  autoUpdater.on('download-progress', (p) => setUpd({ status: 'downloading', percent: Math.round(p.percent) }));
+  autoUpdater.on('update-downloaded', (info) => {
+    setUpd({ status: 'ready', version: info.version, percent: 100 });
+    buildTrayMenu();
+    showNotice(T('Atualização pronta'), T('O Rotaz {0} foi baixado. Reinicie para usar a versão nova.', info.version));
+  });
+  autoUpdater.on('error', (e) => {
+    // Release publicada sem os arquivos da atualização (feita à mão ou antes dela existir): não há o que instalar.
+    if (/latest[\w-]*\.yml/.test(String(e?.message)) && /404/.test(String(e?.message))) { setUpd({ status: 'none', error: null, checkedAt: Date.now() }); return; }
+    setUpd({ status: 'error', error: String(e?.message ?? e).slice(0, 200), checkedAt: Date.now() });
+    gateway?.log.warn(`atualização automática falhou: ${upd.error}`);
+  });
+  setTimeout(checkUpdates, 15000);
+  setInterval(checkUpdates, 6 * 3600 * 1000).unref();
+}
+function installUpdate() {
+  if (upd.status !== 'ready') return;
+  quitting = true;
+  autoUpdater.quitAndInstall(true, true); // instalação silenciosa e o app abre de novo em seguida
+}
+ipcMain.handle('rotaz:update', (e, action) => {
+  if (!fromPanel(e)) return null;
+  if (action === 'check') checkUpdates();
+  if (action === 'install') installUpdate();
+  return { ...upd, enabled: updatesEnabled() };
+});
+
 function buildTrayMenu() {
   if (!tray) return;
   const running = gateway ? T('Gateway ativo em {0}', new URL(panelUrl).host) : T('Conectado ao Rotaz em {0}', new URL(panelUrl).host);
   tray.setContextMenu(Menu.buildFromTemplate([
+    upd.status === 'ready' && { label: T('Reiniciar e atualizar para {0}', upd.version), click: installUpdate },
+    upd.status === 'ready' && { type: 'separator' },
     { label: T('Abrir Rotaz'), click: showWindow },
     { label: running, enabled: false },
     { type: 'separator' },
@@ -261,7 +332,7 @@ function buildTrayMenu() {
     { label: T('Abrir pasta de dados'), enabled: !!gateway, click: () => shell.openPath(dataDir) },
     { type: 'separator' },
     { label: T('Sair do Rotaz'), click: () => { quitting = true; app.quit(); } },
-  ]));
+  ].filter(Boolean)));
 }
 
 function createTray() {
@@ -283,6 +354,7 @@ app.whenReady().then(async () => {
   }
   createTray();
   createWindow();
+  setupUpdater();
   app.on('activate', showWindow); // macOS: clique no ícone do Dock
 });
 

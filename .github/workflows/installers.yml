@@ -60,6 +60,9 @@ jobs:
           path: |
             desktop/dist/*.exe
             desktop/dist/*.dmg
+            # Usados pela atualização automática: o app lê latest.yml e baixa só o que mudou com o .blockmap.
+            desktop/dist/*.blockmap
+            desktop/dist/latest*.yml
           if-no-files-found: error
 
   release:

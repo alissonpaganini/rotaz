@@ -5,14 +5,21 @@ import { fileURLToPath } from 'node:url';
 import { hashPassword, verifyPassword, randomToken, sha256, safeEqual } from './crypto.js';
 import { LoginGuard, isLoopbackHost, aliasCompat } from './security.js';
 import { readJson } from './gateway.js';
-import { testProvider, discoverModels } from './tester.js';
-import { buildRoute } from './routing.js';
+import { testProvider, discoverCatalog } from './tester.js';
+import { buildRoute, routeProblem } from './routing.js';
 import { setAutoStart, autoStartSupported, autoStartLabel } from './autostart.js';
 import { PRESETS, CATEGORIES } from './presets.js';
 import { LocalError, CODES, resolveLang, tr, localizeTest } from './i18n.js';
+import { dayKey as dayKeyOf } from './budget.js';
+import { exportProfile, inspectBackup, importProfile } from './backup.js';
+import { UpdateChecker } from './updates.js';
+
+/** Versão do Rotaz: o app de desktop informa a dele; no terminal, vem do package.json. */
+const PKG_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')).version; } catch { return null; } })();
+const appVersion = () => process.env.ROTAZ_VERSION || PKG_VERSION;
 
 const PUBLIC = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
-const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/logo.svg': ['logo.svg', 'image/svg+xml', true], '/favicon.svg': ['favicon.svg', 'image/svg+xml', true], '/splash.js': ['splash.js', 'text/javascript; charset=utf-8'], '/theme.js': ['theme.js', 'text/javascript; charset=utf-8'], '/i18n.js': ['i18n.js', 'text/javascript; charset=utf-8'],
+const STATIC = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/style.css': ['style.css', 'text/css; charset=utf-8'], '/logo.svg': ['logo.svg', 'image/svg+xml', true], '/favicon.svg': ['favicon.svg', 'image/svg+xml', true], '/splash.js': ['splash.js', 'text/javascript; charset=utf-8'], '/theme.js': ['theme.js', 'text/javascript; charset=utf-8'], '/i18n.js': ['i18n.js', 'text/javascript; charset=utf-8'], '/alias.js': ['alias.js', 'text/javascript; charset=utf-8'],
   ...Object.fromEntries(CODES.filter((c) => c !== 'pt-BR').map((c) => [`/i18n/${c}.json`, [`i18n/${c}.json`, 'application/json; charset=utf-8']])) };
 const TYPES = { svg: 'image/svg+xml', js: 'text/javascript; charset=utf-8', woff2: 'font/woff2' };
 /**
@@ -39,11 +46,12 @@ class HttpError extends LocalError { constructor(status, key, ...args) { super(k
 /** Idioma de quem chamou o painel: o painel manda o dele; sem isso, o do sistema. */
 const reqLang = (req, store) => (CODES.includes(req.headers['x-rotaz-lang']) ? req.headers['x-rotaz-lang'] : resolveLang(store.ui.lang));
 
-export function createAdmin({ store, metrics, log, limiter, gateway, setupToken, onRebind, dataDir }) {
+export function createAdmin({ store, metrics, log, limiter, gateway, budget, setupToken, onRebind, dataDir }) {
   const sessions = new Map();
   const guard = new LoginGuard();
   const tests = new Map();       // modelId -> último resultado de teste (em memória)
   const discovered = new Map();  // provedor+URL -> lista de modelos do provedor, por 1 h
+  const updates = new UpdateChecker({ store, log, currentVersion: appVersion() });
   const state = { setupToken };
 
   const json = (res, status, obj, headers = {}) => {
@@ -86,6 +94,20 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
     };
   }
 
+  /** Gasto para o painel, já na moeda de exibição: hoje, mês, últimos 30 dias, por provedor e o orçamento. */
+  function spendSummary(m) {
+    const s = budget.state();
+    const r = s.rate || 1;
+    const keys = Object.keys(m.days).sort();
+    const byProvider = {};
+    for (const k of keys.filter((k) => k.slice(0, 7) === s.monthKey)) for (const [id, v] of Object.entries(m.days[k].providers)) byProvider[id] = (byProvider[id] ?? 0) + v * r;
+    const last30 = [];
+    for (let i = 29; i >= 0; i--) { const d = new Date(Date.now() - i * 86400000); const k = dayKeyOf(d); last30.push({ day: k, cost: (m.days[k]?.cost ?? 0) * r }); }
+    const unpricedMonth = keys.filter((k) => k.slice(0, 7) === s.monthKey).reduce((n, k) => n + (m.days[k].unpriced ?? 0), 0);
+    return { currency: s.currency, rate: r, today: s.day.spent, month: s.month.spent, total: m.cost * r, days: last30, byProvider, unpricedMonth,
+      budget: { daily: s.daily, monthly: s.monthly, warnAt: s.warnAt, action: s.action, fallbackAlias: s.fallbackAlias, dayPct: s.day.pct, monthPct: s.month.pct, over: s.over, warn: s.warn } };
+  }
+
   function dashboard() {
     const m = metrics.snapshot();
     const def = store.routing.defaultAlias;
@@ -95,7 +117,8 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
       const s = m.providers[p.id] ?? {};
       return { id: p.id, name: p.name, enabled: p.enabled, priority: p.priority, type: p.type, authScheme: p.authScheme, keyCount: p.keys.filter((k) => k.enabled).length, modelCount: p.models.length,
         requests: s.requests ?? 0, errors: s.errors ?? 0, inputTokens: s.inputTokens ?? 0, outputTokens: s.outputTokens ?? 0,
-        avgLatencyMs: s.latencyCount ? Math.round(s.latencySum / s.latencyCount) : 0, lastOkAt: s.lastOkAt ?? null, lastErrorAt: s.lastErrorAt ?? null, lastError: s.lastError ?? null };
+        avgLatencyMs: s.latencyCount ? Math.round(s.latencySum / s.latencyCount) : 0, lastOkAt: s.lastOkAt ?? null, lastErrorAt: s.lastErrorAt ?? null, lastError: s.lastError ?? null,
+        cost: s.cost ?? 0, unpriced: s.unpriced ?? 0, pricedModels: p.models.filter((x) => x.priceIn !== null || x.priceOut !== null).length };
     });
     return {
       server: { status: store.server.gatewayEnabled === false ? 'paused' : 'online', gatewayEnabled: store.server.gatewayEnabled !== false, host: store.server.host, port: store.server.port, uptimeMs: m.uptimeMs, inflight: m.inflight, pid: process.pid, node: process.version, rssMB: Math.round(process.memoryUsage.rss() / 1048576) },
@@ -103,8 +126,10 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
         alias: def, provider: active.provider.name, upstream: active.model.upstream, baseUrl: active.provider.baseUrl, presetId: active.provider.presetId ?? null,
         chain: targets.slice(1, 4).map((t) => ({ provider: t.provider.name, upstream: t.model.upstream })),
       } : null,
+      routeIssue: active ? null : routeProblem(store, def),
       stats: { requests: m.requests, errors: m.errors, inputTokens: m.inputTokens, outputTokens: m.outputTokens, avgLatencyMs: m.avgLatencyMs },
       providers, minutes: m.minutes, recent: m.recent, errors: m.errorLog,
+      spend: spendSummary(m),
     };
   }
 
@@ -132,10 +157,10 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
     ['POST', /^\/api\/providers\/([\w-]+)\/models\/bulk$/, (b, [id]) => ({ models: store.addModels(id, b.models) })],
     ['POST', /^\/api\/providers\/([\w-]+)\/models\/bulk-update$/, (b, [id]) => { store.updateModels(id, b.ids, b.set); return { ok: true }; }],
     ['POST', /^\/api\/providers\/([\w-]+)\/models\/bulk-delete$/, (b, [id]) => { store.removeModels(id, b.ids); for (const m of b.ids) tests.delete(m); return { ok: true }; }],
-    ['POST', /^\/api\/providers\/([\w-]+)\/test$/, async (b, [id], lang) => {
-      const r = await testProvider(store, id, { modelId: b.modelId, keyId: b.keyId, quick: !!b.quick, timeoutMs: Math.min(store.server.timeoutMs, 60000) });
+    ['POST', /^\/api\/providers\/([\w-]+)\/test$/, async (b, [id], lang, signal) => {
+      const r = await testProvider(store, id, { modelId: b.modelId, keyId: b.keyId, quick: !!b.quick, timeoutMs: Math.min(store.server.timeoutMs, 30000), signal });
       // O último resultado fica com o modelo, para a lista mostrar o estado sem testar de novo.
-      if (r.modelId && !b.keyId) tests.set(r.modelId, { status: r.status, label: r.label, message: r.message, latencyMs: r.latencyMs ?? null, quick: r.quick, toolsOk: r.toolsOk, at: r.at });
+      if (r.modelId && !b.keyId && r.status !== 'aborted') tests.set(r.modelId, { status: r.status, label: r.label, message: r.message, latencyMs: r.latencyMs ?? null, quick: r.quick, toolsOk: r.toolsOk, at: r.at });
       return localizeTest(lang, r);
     }],
     ['POST', /^\/api\/providers\/([\w-]+)\/discover$/, async (b, [id]) => {
@@ -144,11 +169,20 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
       const key = `${id}|${p.baseUrl}`;
       const hit = discovered.get(key);
       if (hit && !b.refresh && Date.now() - hit.at < 3600000) return { ...hit, cached: true };
-      const entry = { models: await discoverModels(store, id), at: Date.now() };
+      const entry = { ...(await discoverCatalog(store, id)), at: Date.now() };
       discovered.set(key, entry);
       return { ...entry, cached: false };
     }],
     ['PUT', /^\/api\/routing$/, (b) => { store.updateRouting(b); return store.routing; }],
+    // Backup do perfil (src/backup.js). A senha, quando existe, só cifra as chaves dentro do arquivo.
+    ['POST', /^\/api\/backup\/export$/, (b) => exportProfile(store, { password: b.password, appVersion: appVersion() })],
+    ['POST', /^\/api\/backup\/inspect$/, (b) => inspectBackup(b.file)],
+    ['POST', /^\/api\/backup\/import$/, (b) => { const r = importProfile(store, b.file, { password: b.password, mode: b.mode }); tests.clear(); discovered.clear(); log.info(`perfil importado (${r.mode}): ${r.providers} provedor(es)`); return r; }],
+    // Versão nova no GitHub (terminal e macOS; no Windows o app se atualiza sozinho). Respeita a opção em Configurações.
+    ['GET', /^\/api\/update$/, () => updates.status()],
+    ['POST', /^\/api\/update\/check$/, () => updates.status({ force: true })],
+    ['GET', /^\/api\/budget$/, () => ({ ...store.budget, aliases: store.aliases() })],
+    ['PUT', /^\/api\/budget$/, (b) => store.updateBudget(b)],
     ['GET', /^\/api\/settings$/, () => ({ server: store.server, autoStartSupported: autoStartSupported(), autoStartLabel: autoStartLabel(), desktop: !!state.desktop, masterKeySource: state.masterKeySource, logFile: log.file })],
     ['PUT', /^\/api\/settings$/, (b) => {
       const before = `${store.server.host}:${store.server.port}`;
@@ -190,7 +224,7 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
     if (url.pathname === '/api/auth/status') {
       // Tema e paleta não são sensíveis: vêm junto para a tela de login já sair com a aparência escolhida.
       const authenticated = !!sessionOf(req);
-      return json(res, 200, { configured: !!store.c.admin.passHash, authenticated, ui: store.ui, ...(authenticated && { address: `${store.server.host}:${store.server.port}`, gatewayEnabled: store.server.gatewayEnabled !== false }) });
+      return json(res, 200, { configured: !!store.c.admin.passHash, authenticated, ui: store.ui, version: appVersion(), ...(authenticated && { address: `${store.server.host}:${store.server.port}`, gatewayEnabled: store.server.gatewayEnabled !== false }) });
     }
     if (req.method !== 'POST') throw new HttpError(405, 'Método não permitido.');
     if (url.pathname === '/api/auth/setup') {
@@ -274,7 +308,10 @@ export function createAdmin({ store, metrics, log, limiter, gateway, setupToken,
         const m = re.exec(url.pathname);
         if (!m || method !== req.method) continue;
         const body = method === 'GET' || method === 'DELETE' ? {} : await readJson(req, 1024 * 1024);
-        json(res, 200, await fn(body, m.slice(1), reqLang(req, store)));
+        // Se o painel desistir (fechou a aba, interrompeu o teste), o trabalho em andamento é cancelado.
+        const ac = new AbortController();
+        res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+        json(res, 200, await fn(body, m.slice(1), reqLang(req, store), ac.signal));
         return true;
       }
       throw new HttpError(404, 'Rota não encontrada.');

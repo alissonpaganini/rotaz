@@ -1,8 +1,11 @@
 // Métricas em memória com persistência periódica. Nenhum conteúdo de mensagem é guardado aqui.
 import fs from 'node:fs';
 import { redact } from './security.js';
+import { dayKey } from './budget.js';
 
-const blank = () => ({ requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, latencySum: 0, latencyCount: 0 });
+// cost: dólares gastos (só pedidos de modelos com preço); unpriced: pedidos com tokens de modelos sem preço
+const blank = () => ({ requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, latencySum: 0, latencyCount: 0, cost: 0, unpriced: 0 });
+const blankDay = () => ({ cost: 0, requests: 0, unpriced: 0, providers: {} });
 
 export class Metrics {
   constructor(file) {
@@ -13,11 +16,12 @@ export class Metrics {
     this.errors = [];
     this.recent = [];
     this.minutes = [];
+    this.days = {}; // 'AAAA-MM-DD' -> gasto do dia, guardado por 62 dias
     this.inflight = 0;
     this.dirty = false;
     try {
       const d = JSON.parse(fs.readFileSync(file, 'utf8'));
-      Object.assign(this, { totals: { ...blank(), ...d.totals }, providers: d.providers ?? {}, errors: d.errors ?? [], minutes: d.minutes ?? [] });
+      Object.assign(this, { totals: { ...blank(), ...d.totals }, providers: d.providers ?? {}, errors: d.errors ?? [], minutes: d.minutes ?? [], days: d.days ?? {} });
     } catch { /* primeira execução */ }
     this.t = setInterval(() => this.flush(), 30000);
     this.t.unref();
@@ -36,15 +40,37 @@ export class Metrics {
     return b;
   }
 
-  /** Fim de uma requisição do cliente, com ou sem sucesso. */
+  day(key = dayKey()) {
+    if (!this.days[key]) {
+      this.days[key] = blankDay();
+      const keys = Object.keys(this.days).sort();
+      for (const k of keys.slice(0, Math.max(0, keys.length - 62))) delete this.days[k];
+    }
+    return this.days[key];
+  }
+  /** Dólares gastos num dia ('AAAA-MM-DD') ou num mês ('AAAA-MM'). */
+  spentOn(key) { return this.days[key]?.cost ?? 0; }
+  spentIn(prefix) { return Object.entries(this.days).reduce((sum, [k, d]) => sum + (k.startsWith(prefix) ? d.cost : 0), 0); }
+
+  /** Fim de uma requisição do cliente, com ou sem sucesso. `cost` em dólares, ou null sem preço. */
   record(e) {
     const ok = e.status < 400;
     const inT = e.input ?? 0;
     const outT = e.output ?? 0;
     const b = this.bucket();
+    const priced = typeof e.cost === 'number' && e.cost > 0;
+    const unpriced = e.cost === null && inT + outT > 0 ? 1 : 0;
+    if (priced || unpriced || e.providerId) {
+      const d = this.day();
+      d.requests++;
+      if (priced) { d.cost += e.cost; if (e.providerId) d.providers[e.providerId] = (d.providers[e.providerId] ?? 0) + e.cost; }
+      d.unpriced += unpriced;
+    }
     for (const s of [this.totals, e.providerId ? this.provider(e.providerId) : null]) {
       if (!s) continue;
       s.requests++;
+      if (priced) s.cost = (s.cost ?? 0) + e.cost;
+      s.unpriced = (s.unpriced ?? 0) + unpriced;
       if (!ok) s.errors++;
       s.inputTokens += inT;
       s.outputTokens += outT;
@@ -57,7 +83,7 @@ export class Metrics {
       const p = this.provider(e.providerId);
       if (ok) p.lastOkAt = Date.now();
     }
-    this.recent.unshift({ at: Date.now(), id: e.id, alias: e.alias, provider: e.providerName, model: e.upstream, status: e.status, ms: e.ms, ttfb: e.ttfb, input: inT, output: outT, stream: !!e.stream, proto: e.proto, via: e.via });
+    this.recent.unshift({ at: Date.now(), id: e.id, alias: e.alias, provider: e.providerName, model: e.upstream, status: e.status, ms: e.ms, ttfb: e.ttfb, input: inT, output: outT, cost: typeof e.cost === 'number' ? e.cost : null, stream: !!e.stream, proto: e.proto, via: e.via });
     if (this.recent.length > 100) this.recent.pop();
     if (!ok) this.error({ status: e.status, alias: e.alias, provider: e.providerName, message: e.error });
     this.dirty = true;
@@ -86,11 +112,12 @@ export class Metrics {
       requests: t.requests, errors: t.errors, inputTokens: t.inputTokens, outputTokens: t.outputTokens,
       avgLatencyMs: t.latencyCount ? Math.round(t.latencySum / t.latencyCount) : 0,
       providers: this.providers, minutes: recentMin, recent: this.recent.slice(0, 30), errorLog: this.errors.slice(0, 50),
+      cost: t.cost ?? 0, unpriced: t.unpriced ?? 0, days: this.days,
     };
   }
 
   reset() {
-    Object.assign(this, { totals: blank(), providers: {}, errors: [], recent: [], minutes: [], dirty: true });
+    Object.assign(this, { totals: blank(), providers: {}, errors: [], recent: [], minutes: [], days: {}, dirty: true });
     this.flush();
   }
 
@@ -99,7 +126,7 @@ export class Metrics {
     this.dirty = false;
     try {
       const tmp = `${this.file}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({ totals: this.totals, providers: this.providers, errors: this.errors, minutes: this.minutes }));
+      fs.writeFileSync(tmp, JSON.stringify({ totals: this.totals, providers: this.providers, errors: this.errors, minutes: this.minutes, days: this.days }));
       fs.renameSync(tmp, this.file);
     } catch { this.dirty = true; }
   }

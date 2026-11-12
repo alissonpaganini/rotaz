@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Vault, loadMasterKey, randomToken } from './crypto.js';
 import { Store } from './store.js';
 import { Metrics } from './metrics.js';
+import { Budget } from './budget.js';
 import { createLogger } from './logger.js';
 import { RateLimiter } from './security.js';
 import { createGateway } from './gateway.js';
@@ -30,7 +31,8 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
   const log = createLogger(dataDir, () => store.server.logLevel, { console: !quiet });
   const metrics = new Metrics(path.join(dataDir, 'stats.json'));
   const limiter = new RateLimiter();
-  const gateway = createGateway({ store, metrics, log, limiter });
+  const budget = new Budget(store, metrics);
+  const gateway = createGateway({ store, metrics, log, limiter, budget });
 
   let setupToken = null;
   if (!store.c.admin.passHash) {
@@ -39,7 +41,7 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
   }
 
   let server;
-  const admin = createAdmin({ store, metrics, log, limiter, gateway, setupToken, dataDir, onRebind: () => rebind() });
+  const admin = createAdmin({ store, metrics, log, limiter, gateway, budget, setupToken, dataDir, onRebind: () => rebind() });
   admin.state.masterKeySource = keySourceName ?? source;
   admin.state.desktop = desktop;
 
@@ -98,7 +100,7 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
     await log.close();
   };
 
-  return { store, metrics, log, gateway, listen, close, setupToken, keySource: source };
+  return { store, metrics, budget, log, gateway, listen, close, setupToken, keySource: source };
 }
 
 function openBrowser(url) {

@@ -21,7 +21,7 @@ Cada alias público (`claude-*`) aponta para provedor, modelo real, URL base e c
 
 | Para quem | Como |
 | --- | --- |
-| Qualquer pessoa | **App instalável:** `Rotaz-Setup.exe` (Windows) ou `Rotaz.dmg` (macOS). Abre o painel numa janela própria e fica na bandeja do sistema. |
+| Qualquer pessoa | **App instalável:** `Rotaz-<versão>-Windows-x64-Setup.exe` (Windows) ou `Rotaz-<versão>-macOS-universal.dmg` (macOS). O nome de cada arquivo diz o sistema. Abre o painel numa janela própria e fica na bandeja do sistema. |
 | Quem usa terminal | **Código-fonte:** `npm start`, com Node 20.11 ou superior e nenhuma dependência para instalar. |
 
 Os dois rodam exatamente o mesmo gateway e o mesmo painel.
@@ -35,6 +35,7 @@ Os dois rodam exatamente o mesmo gateway e o mesmo painel.
 - **Dados:** ficam em `%APPDATA%\Rotaz\data` (Windows) ou `~/Library/Application Support/Rotaz/data` (macOS).
 - **Chave mestra:** protegida pelo DPAPI no Windows e pelo Keychain no macOS.
 - **Convivência com o terminal:** se uma versão de terminal já estiver rodando na mesma porta, o app abre esse painel em vez de iniciar um segundo gateway.
+- **Atualizações:** no Windows, o app baixa a versão nova das Releases do GitHub em segundo plano e instala ao reiniciar (pelo aviso, pelo menu da logo, pela bandeja ou ao fechar o app). No macOS e no terminal, o painel só avisa e mostra o link. Desligue em Configurações → Sistema e segurança → **Atualizações**; desligado, o Rotaz não consulta o GitHub. A consulta envia só o IP e a versão instalada.
 
 ### Gerar os instaladores
 
@@ -60,6 +61,16 @@ Para distribuir sem esses avisos, você precisa de:
 
 Cadastre esses segredos no repositório do GitHub; o workflow já os usa.
 
+### Publicar uma versão
+
+A atualização automática lê a Release mais recente do repositório. Para lançar uma versão:
+
+1. Suba `version` em `desktop/package.json` (e em `package.json` da raiz, para a versão de terminal).
+2. Crie e envie a tag: `git tag v1.1.0 && git push origin v1.1.0`.
+3. O workflow gera os instaladores e publica a Release com `latest.yml` e os `.blockmap`. Sem esses arquivos, o app instalado não enxerga a versão nova.
+
+A Release precisa estar publicada (não rascunho nem pré-lançamento).
+
 ## Início rápido (terminal)
 
 Requer Node 20.11 ou superior.
@@ -75,7 +86,8 @@ No Windows, um duplo clique em `Iniciar.cmd` faz o mesmo. O painel abre em <http
 3. **Importar do provedor:** lista os modelos do provedor (em cache por 1 h; "Atualizar lista" busca de novo). Filtre, marque vários, ajuste os aliases sugeridos e adicione todos de uma vez. Para um modelo só, use "Adicionar modelo".
 4. **Testar:** faz requisições reais ao provedor. Na tabela de modelos, marque vários para testar, ativar, desativar, editar ou remover em massa. "Testar todos" faz o teste rápido de todos os modelos ativos.
    - **Teste rápido:** uma chamada de texto por modelo, bom para listas grandes.
-   - **Teste completo:** texto, streaming e ferramentas, três chamadas por modelo.
+   - **Teste completo:** texto e, em seguida, streaming e ferramentas ao mesmo tempo (três chamadas por modelo).
+   - Cada teste tem prazo total, então um provedor mudo vira falha em vez de travar a lista. **Interromper** cancela também o que já está em andamento.
    - O último resultado fica na coluna "Último teste" até o servidor reiniciar.
 5. **Roteamento:** escolha o modelo padrão, as famílias e o fallback.
 
@@ -87,11 +99,15 @@ A aba **Claude Code** do painel mostra a URL e o token prontos para copiar. O to
 
 ### Claude Desktop (modo desenvolvedor)
 
-1. Menu **Help → Troubleshooting → Enable Developer Mode**.
-2. Menu **Developer → Configure Third-Party Inference**.
-3. **Inference provider:** Gateway.
-4. **Gateway base URL:** `http://127.0.0.1:8787`. **Gateway API key:** o token do painel. **Gateway auth scheme:** bearer.
-5. Deixe **Model discovery** ligado, aplique e reinicie o app.
+Os nomes abaixo são os do Claude Desktop em português; em inglês, entre parênteses. O painel mostra o passo a passo no idioma escolhido.
+
+1. Menu **Ajuda → Solução de problemas → Ativar modo de desenvolvedor** (Help → Troubleshooting → Enable Developer Mode).
+2. Menu **Desenvolvedor → Configurar inferência de terceiros** (Developer → Configure Third-Party Inference).
+3. Em **Conexão** (Connection), escolha **Gateway**.
+4. **Tipo de credencial** (Credential type): Chave de API estática.
+5. **URL base do gateway** (Gateway base URL): `http://127.0.0.1:8787`. **Chave de API do gateway** (Gateway API key): o token do painel.
+6. **Esquema de autenticação do gateway** (Gateway auth scheme): bearer.
+7. Deixe ligada a **Descoberta de modelos** (Model discovery), clique em **Aplicar alterações** e reinicie o app.
 
 ### Claude Code no terminal
 
@@ -115,7 +131,7 @@ Medido nos binários instalados (Claude Code 2.1.317 e Claude Desktop 4.16336):
 - O Claude Code consulta `GET /v1/models?limit=1000` e mantém apenas ids que casam com `/(claude|anthropic)/i`. O prefixo `claude-` resolve isso.
 - **O seletor do Claude Desktop aplica um filtro adicional:** descarta ids que citam outros fornecedores (`gpt`, `gemini`, `deepseek`, `grok`, `qwen`, `llama`, `mistral` e outros), mesmo com o prefixo. Assim, `claude-gpt` funciona no terminal, mas não aparece nesse seletor.
 
-O painel marca cada alias como "CLI e Desktop" ou "Só CLI" e avisa enquanto você digita. Um alias oculto no seletor continua funcionando como modelo padrão, porque o gateway decide o destino: o Claude Code pode pedir qualquer nome e receber o modelo configurado em **Roteamento**.
+O painel diz onde cada alias aparece ("CLI e Desktop" ou "Só CLI") enquanto você digita, e sugere nomes parecidos que servem para os dois: uma letra a mais ou um hífen entre as sílabas (`claude-gpt-4o` → `claude-gept-4o`, `claude-deepseek-chat` → `claude-deeepseek-chat` ou `claude-deep-seek-chat`). Ao importar, os nomes já saem assim (dá para escolher "Iguais ao provedor"). Na tabela, "Renomear para o Desktop" e "Ajustar para o Desktop" (em massa) trocam os nomes, e o roteamento acompanha. A regra fica em `public/alias.js`, a mesma no painel e no servidor. Um alias oculto no seletor continua funcionando como modelo padrão, porque o gateway decide o destino: o Claude Code pode pedir qualquer nome e receber o modelo configurado em **Roteamento**.
 
 O gateway não falsifica metadados para contornar esse filtro. Ele publica os aliases como você os cadastrou.
 
@@ -124,6 +140,25 @@ O gateway não falsifica metadados para contornar esse filtro. Ele publica os al
 O painel, a abertura, a bandeja e as mensagens de erro estão em português (Brasil), inglês, espanhol, chinês simplificado, japonês, coreano, alemão e francês. O Rotaz segue a língua do sistema e usa inglês quando ela não está na lista. Troque em **Configurações → Aparência → Idioma** ou no seletor da abertura. `ROTAZ_LANG=<código>` substitui o idioma do sistema no modo automático.
 
 Para acrescentar um texto, escreva-o em português dentro de `L('...')` (painel) ou `K('...')` / `LocalError('...')` (servidor) e adicione a tradução em cada `public/i18n/<código>.json`.
+
+## Gasto e orçamento
+
+Cadastre o preço de cada modelo (em dólar por 1 milhão de tokens, como na página de preços do provedor) e o Rotaz mostra quanto você gasta: o mês, o dia, os últimos 30 dias e os provedores que mais gastaram, no quadro **Gasto** da visão geral. Ao importar modelos do OpenRouter, os preços vêm preenchidos. Modelos locais custam 0; modelo sem preço não entra na conta, e o painel avisa quantos pedidos ficaram de fora.
+
+Em **Configurações → Gastos e orçamento**:
+
+- **Moeda:** dólar, real ou euro, com a cotação que você informar.
+- **Limites por dia e por mês**, com aviso ao chegar a uma porcentagem (80% por padrão). No app, o aviso também sai como notificação.
+- **Ao atingir o limite:** só avisar, trocar todos os pedidos para um modelo de reserva (barato ou local) ou bloquear os pedidos até o fim do período (o Claude Code recebe o erro 402).
+
+O gasto é uma estimativa feita pelos tokens que o provedor informa; a cobrança de verdade é a do provedor.
+
+## Backup do perfil
+
+Clique na logo do Rotaz (na barra de título do app, ou no topo da barra lateral no navegador) para abrir o menu: **Exportar perfil**, **Importar perfil**, **Documentação**, **Reportar um problema** e **Sobre o Rotaz**.
+
+- **Exportar:** salva provedores, modelos (com preços), rotas, orçamento, aparência e limites num arquivo `.json`. As chaves de API só entram se você escolher uma senha: elas vão cifradas com ela (AES-256-GCM, chave derivada por scrypt), porque a chave mestra de um computador não vale em outro. A senha do painel, o token do gateway, métricas e registros nunca entram.
+- **Importar:** mostra o que vem no arquivo antes de aplicar. **Substituir tudo** troca a configuração atual pela do arquivo; **Acrescentar provedores** só soma os provedores e mantém o resto. Sem a senha, os provedores entram sem as chaves. Tudo é aplicado de uma vez: se algo no arquivo for inválido, nada muda.
 
 ## Roteamento
 

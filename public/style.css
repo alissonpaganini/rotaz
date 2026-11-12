@@ -316,8 +316,6 @@ th.chk, td.chk { width: 40px; padding-right: 0; }
 .badge .dot { width: 6px; height: 6px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
 .dot.pos { background: var(--pos); } .dot.neg { background: var(--neg); } .dot.warn { background: var(--warn); }
-.dot.live { animation: live 2.4s var(--ease) infinite; }
-@keyframes live { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 
 /* ---------- controles ---------- */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--s-2); height: var(--h-md); padding: 0 var(--s-4); border-radius: var(--r-sm); border: 0; background: var(--surface-3); color: var(--ink); font: var(--t-label); cursor: pointer; white-space: nowrap; text-decoration: none; transition: background-color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease), opacity var(--dur-1); }
@@ -665,3 +663,51 @@ dialog::backdrop { background: var(--scrim); }
   .hero { font-size: 44px; line-height: 48px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+
+/* ---------- gasto e orçamento ---------- */
+.field[hidden] { display: none; }
+.spend-head { align-items: baseline; }
+/* 30 dias em barras finas: a altura vem de --h (0 a 1), só por transform */
+.spend-bars { display: flex; align-items: flex-end; gap: 2px; height: calc(var(--s-9) + var(--s-2)); margin-top: var(--s-2); }
+.spend-bars i { flex: 1; min-width: 0; height: 100%; border-radius: var(--r-xs) var(--r-xs) 0 0; background: var(--d1); transform: scaleY(var(--h, 0)); transform-origin: bottom; transition: opacity var(--dur-1) var(--ease); }
+.spend-bars:hover i { opacity: .55; }
+.spend-bars i:hover { opacity: 1; }
+.spend-limit { display: flex; flex-direction: column; gap: var(--s-2); margin-top: var(--s-2); }
+.spend-top { display: grid; gap: var(--s-2); margin-top: var(--s-2); padding-top: var(--s-3); border-top: 1px solid var(--line); }
+.spend-top .row > span:first-child { min-width: 0; }
+.spend-note { display: inline-flex; align-items: center; gap: var(--s-1); margin-top: var(--s-1); }
+.spend-note .ico { width: 14px; height: 14px; flex: none; }
+.budget-notice { display: flex; align-items: center; gap: var(--s-3); margin-bottom: var(--s-5); }
+.budget-notice .notice { flex: 1; min-width: 0; }
+.field .hint { overflow-wrap: anywhere; }
+
+/* ---------- menu da logo ---------- */
+/* a logo vira botão: abre o menu do Rotaz (perfil, ajuda e Sobre); fora da área de arrastar da barra de título */
+.brand-btn { border: 0; color: var(--ink); cursor: pointer; -webkit-app-region: no-drag; transition: background-color var(--dur-1) var(--ease); }
+.tb-brand.brand-btn:hover { background: var(--surface-3); }
+.brand.brand-btn { width: fit-content; border-radius: var(--r-sm); background: transparent; }
+.brand.brand-btn:hover { background: var(--surface-3); }
+.brand-caret { width: 12px; height: 12px; color: var(--ink-3); flex: none; }
+.about { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-3); }
+.about .wordmark { height: var(--logo-auth); margin-bottom: var(--s-2); }
+.about p { margin: 0; }
+
+/* Atualizações: ponto de destaque na logo quando há versão nova, e ação abaixo do estado em Configurações. */
+.brand-btn { position: relative; }
+.brand-btn.has-update::after { content: ""; position: absolute; top: var(--s-1); right: var(--s-1); width: var(--s-2); height: var(--s-2); border-radius: 50%; background: var(--accent); }
+.update-setting .row { margin-top: var(--s-2); }
+.update-setting .row:empty { display: none; }
+
+/* Alias: onde o nome aparece (CLI e Desktop) e nomes que funcionam nos dois. */
+.alias-assist { display: flex; flex-direction: column; gap: var(--s-2); margin-top: calc(var(--s-1) - var(--s-2)); min-width: 0; }
+.alias-status { display: flex; align-items: flex-start; gap: var(--s-2); font: var(--t-meta); color: var(--ink-3); }
+.alias-status .badge { flex: none; }
+.alias-status span:last-child { min-width: 0; overflow-wrap: anywhere; padding-top: 3px; }
+.alias-picks { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); min-width: 0; }
+.alias-picks[hidden] { display: none; }
+.alias-picks .btn { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.btn.mono { font-family: var(--mono); font-size: 12.5px; font-weight: 500; }
+.import-naming { gap: var(--s-3); }
+.rename-list { display: flex; flex-direction: column; gap: var(--s-2); max-height: 280px; overflow: auto; }
+.rename-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: var(--s-2); }
+.rename-row .ico { width: 14px; height: 14px; color: var(--ink-3); }

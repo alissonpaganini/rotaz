@@ -21,7 +21,13 @@ const firstStatus = await fetch('/api/auth/status').then((r) => r.json()).catch(
 await setLanguage(pendingLang.get() ?? firstStatus.ui?.lang ?? 'auto');
 
 const root = document.getElementById('app');
-const state = { view: 'overview', sub: [], provider: null, tests: {}, timer: null, sel: {}, live: {}, mfilter: {}, aliases: [], bulk: null, catalog: null, seen: new Set() };
+// Regras de nome do Claude Code e do Claude Desktop, as mesmas do servidor (public/alias.js).
+const { analyzeAlias, aliasSuggestions, bestAlias } = await import('/alias.js').catch(() => ({
+  analyzeAlias: (a) => ({ alias: String(a).toLowerCase(), problem: null, valid: true, cli: true, desktop: true, blocked: [] }),
+  aliasSuggestions: () => [], bestAlias: () => 'claude-modelo',
+}));
+
+const state = { view: 'overview', sub: [], provider: null, tests: {}, timer: null, sel: {}, live: {}, mfilter: {}, aliases: [], runs: new Map(), catalog: null, seen: new Set() };
 
 // ---------- DOM ----------
 function h(tag, attrs, ...kids) {
@@ -94,7 +100,7 @@ async function place(anchor, floating, placement = 'bottom-end') {
 let openMenu = null;
 function closeMenu() { openMenu?.(); openMenu = null; }
 /** Menu de ações. itens: [{ label, icon, onClick, danger }] ou 'sep'. */
-function menu(anchor, items) {
+function menu(anchor, items, placement) {
   closeMenu();
   const el = h('div', { class: 'menu', role: 'menu' }, items.filter(Boolean).map((it) => (it === 'sep' ? h('hr') : h('button', {
     type: 'button', role: 'menuitem', class: it.danger ? 'danger' : undefined, disabled: it.disabled,
@@ -102,7 +108,7 @@ function menu(anchor, items) {
   }, it.icon && icon(it.icon), it.label))));
   el.style.left = '-9999px';
   document.body.append(el);
-  place(anchor, el);
+  place(anchor, el, placement);
   animate(el, { opacity: [0, 1], transform: ['translateY(-4px)', 'translateY(0)'] }, { duration: 0.18 });
   const onDoc = (e) => { if (!el.contains(e.target) && e.target !== anchor && !anchor.contains(e.target)) closeMenu(); };
   const onKey = (e) => { if (e.key === 'Escape') { closeMenu(); anchor.focus(); } };
@@ -130,8 +136,8 @@ document.addEventListener('mouseover', (e) => {
 
 // ---------- API ----------
 class ApiError extends Error { constructor(s, m) { super(m); this.status = s; } }
-async function api(method, path, body) {
-  const r = await fetch(path, { method, headers: { 'content-type': 'application/json', 'x-gateway-csrf': '1', 'x-rotaz-lang': currentLang() }, body: body === undefined ? undefined : JSON.stringify(body) });
+async function api(method, path, body, { signal } = {}) {
+  const r = await fetch(path, { method, signal, headers: { 'content-type': 'application/json', 'x-gateway-csrf': '1', 'x-rotaz-lang': currentLang() }, body: body === undefined ? undefined : JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && !path.startsWith('/api/auth/')) { stopPolling(); boot(); throw new ApiError(401, L('Sessão expirada.')); }
   if (!r.ok) throw new ApiError(r.status, j.error ?? L('Erro {0}', r.status));
@@ -158,6 +164,10 @@ const fmt = (n) => (n ?? 0).toLocaleString(currentLang());
 const compact = (n) => (n >= 1e4 ? new Intl.NumberFormat(currentLang(), { notation: 'compact', maximumFractionDigits: 1 }).format(n) : fmt(n));
 const ms = (v) => (v ? (v >= 1000 ? `${(v / 1000).toLocaleString(currentLang(), { maximumFractionDigits: 1 })} s` : `${v} ms`) : '—');
 const time = (t) => new Date(t).toLocaleTimeString(currentLang(), { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+/** Dinheiro na moeda escolhida; valores pequenos ganham casas para não virarem zero. */
+const money = (v, cur = 'USD') => new Intl.NumberFormat(currentLang(), { style: 'currency', currency: cur, minimumFractionDigits: 2, maximumFractionDigits: v > 0 && v < 0.1 ? 4 : 2 }).format(v ?? 0);
+/** Preço de modelo em dólar por 1M de tokens, curto: "US$ 0,27 · 1,10". */
+const priceText = (m) => `${money(m.priceIn ?? 0)} · ${new Intl.NumberFormat(currentLang(), { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(m.priceOut ?? 0)}`;
 function ago(t) {
   if (!t) return '—';
   const s = Math.round((Date.now() - t) / 1000);
@@ -238,7 +248,7 @@ function segmented(options, value, onchange, { label, iconsOnly } = {}) {
 const notice = (text, kind = '', title) => h('div', { class: `notice ${kind}` }, icon(kind === 'warn' ? 'warning' : 'info'), h('div', { class: 'n-body' }, title && h('div', { class: 'n-title' }, title), h('div', { class: 'small' }, text)));
 
 /** Diálogo modal com formulário. `submit` pode lançar erro, exibido dentro do diálogo. */
-function dialog({ title, sub, body, submitLabel = L('Salvar'), submit, danger, wide }) {
+function dialog({ title, sub, body, submitLabel = L('Salvar'), submit, danger, wide, info }) {
   const error = h('div', { class: 'form-error', role: 'alert' });
   const dlg = h('dialog', { class: wide ? 'wide' : undefined });
   const close = () => {
@@ -255,7 +265,7 @@ function dialog({ title, sub, body, submitLabel = L('Salvar'), submit, danger, w
   } },
   h('div', { class: 'dlg-head' }, h('h2', {}, title), sub && h('p', { class: 'small' }, sub)),
   h('div', { class: 'dlg-body stack tight' }, body, error),
-  h('div', { class: 'dlg-foot' }, h('button', { type: 'button', class: 'btn', onclick: close }, L('Cancelar')), go));
+  h('div', { class: 'dlg-foot' }, !info && h('button', { type: 'button', class: 'btn', onclick: close }, L('Cancelar')), go));
   dlg.append(form);
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); close(); });
   document.body.append(dlg);
@@ -311,6 +321,169 @@ async function rerender() {
 // ---------- privacidade e termos ----------
 // Páginas do site de divulgação. No app, links externos abrem no navegador do sistema (desktop/main.js).
 const SITE_URL = 'https://rotaz.dev';
+const REPO_URL = 'https://github.com/alissonpaganini/rotaz';
+/** Link externo: no app, abre no navegador do sistema (desktop/main.js); no navegador, numa aba nova. */
+const openLink = (url) => window.open(url, '_blank', 'noopener,noreferrer');
+
+// ---------- menu da logo ----------
+/** A logo é um botão: abre o menu do Rotaz (perfil, ajuda e Sobre). */
+function brandButton(cls, size) {
+  return h('button', { type: 'button', class: `${cls} brand-btn`, 'aria-haspopup': 'menu', 'aria-label': L('Menu do Rotaz'),
+    onclick: (e) => appMenu(e.currentTarget) }, wordmark(size), icon('caret-down', 'brand-caret'));
+}
+function appMenu(anchor) {
+  const authed = !!document.querySelector('.shell'); // backup só com o painel aberto (depois de entrar)
+  const up = updateAction(updates.info);
+  menu(anchor, [
+    up && { label: up.label, icon: 'arrows-clockwise', onClick: up.run },
+    up && 'sep',
+    { label: L('Exportar perfil…'), icon: 'download-simple', disabled: !authed, onClick: exportProfileDialog },
+    { label: L('Importar perfil…'), icon: 'upload-simple', disabled: !authed, onClick: pickProfile },
+    'sep',
+    { label: L('Documentação'), icon: 'arrow-square-out', onClick: () => openLink(`${SITE_URL}/docs.html`) },
+    { label: L('Reportar um problema'), icon: 'warning-circle', onClick: () => openLink(`${REPO_URL}/issues`) },
+    { label: L('Sobre o Rotaz'), icon: 'info', onClick: aboutDialog },
+  ], 'bottom-start');
+}
+
+// ---------- atualizações ----------
+// Dois jeitos: no app do Windows, o próprio app baixa e instala (desktop/main.js, modo 'auto'); no terminal e no
+// macOS, o servidor consulta as Releases e o painel só avisa, com o link de download (src/updates.js, modo 'notify').
+const updates = { info: null, listeners: new Set() };
+async function loadUpdate({ force = false } = {}) {
+  let u;
+  const fromApp = desk?.updateState ? await desk.updateState().catch(() => null) : null;
+  if (fromApp?.mode === 'auto') {
+    if (force) await desk.updateAction('check').catch(() => {});
+    u = { mode: 'auto', enabled: fromApp.enabled, current: fromApp.current, version: fromApp.version, status: fromApp.status, percent: fromApp.percent, error: fromApp.error };
+  } else {
+    const r = await api(force ? 'POST' : 'GET', force ? '/api/update/check' : '/api/update').catch(() => null);
+    if (!r) return updates.info;
+    u = { mode: 'notify', enabled: r.enabled, current: r.current, version: r.latest, status: r.error ? 'error' : r.newer ? 'available' : r.checkedAt ? 'none' : 'idle', url: r.url, error: r.error };
+  }
+  setUpdate(u);
+  return u;
+}
+function setUpdate(u) {
+  const was = updates.info?.status;
+  updates.info = u;
+  for (const b of document.querySelectorAll('.brand-btn')) b.classList.toggle('has-update', u.enabled && ['ready', 'available'].includes(u.status));
+  if (u.status === 'ready' && was && was !== 'ready') toast(L('Versão {0} baixada. Reinicie para atualizar.', u.version));
+  for (const fn of updates.listeners) fn(u);
+}
+window.rotazDesktop?.onUpdate?.((st) => { if (st.mode === 'auto') setUpdate({ ...updates.info, mode: 'auto', enabled: updates.info?.enabled ?? true, current: st.current, version: st.version, status: st.status, percent: st.percent, error: st.error }); });
+/** Frase de estado da atualização, para Configurações. */
+function updateText(u) {
+  if (!u) return '';
+  if (!u.enabled) return L('Desligado. Você está na versão {0}.', u.current ?? '—');
+  return {
+    checking: L('Procurando versão nova…'),
+    downloading: L('Baixando a versão {0}… {1}%', u.version, u.percent ?? 0),
+    ready: L('Versão {0} pronta para instalar.', u.version),
+    available: L('Versão {0} disponível. Você está na {1}.', u.version, u.current),
+    none: L('Você está na versão mais recente ({0}).', u.current),
+    error: L('Não foi possível verificar agora. Tente de novo mais tarde.'),
+  }[u.status] ?? L('Versão {0}.', u.current ?? '—');
+}
+/** A ação que a atualização pede agora: instalar (app) ou baixar (aviso), ou nada. */
+function updateAction(u) {
+  if (!u?.enabled) return null;
+  if (u.status === 'ready') return { label: L('Reiniciar e atualizar para {0}', u.version), run: () => desk.updateAction('install') };
+  if (u.status === 'available') return { label: L('Baixar a versão {0}', u.version), run: () => openLink(u.url) };
+  return null;
+}
+
+/** Salva um arquivo pelo navegador (no app, o sistema pergunta onde guardar). */
+function saveFile(text, name) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  const a = h('a', { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+/** Exportar: o perfil vai sem segredos; com senha, as chaves vão junto, cifradas com ela. */
+function exportProfileDialog() {
+  const withKeys = h('input', { type: 'checkbox' });
+  const pw = h('input', { type: 'password', minlength: 8, autocomplete: 'new-password' });
+  const pw2 = h('input', { type: 'password', minlength: 8, autocomplete: 'new-password' });
+  const secret = h('div', { class: 'form-grid' }, field(L('Senha do backup'), pw, L('8 caracteres ou mais. Sem ela, não há como recuperar as chaves do arquivo.')), field(L('Repita a senha'), pw2));
+  secret.hidden = true;
+  withKeys.addEventListener('change', () => { secret.hidden = !withKeys.checked; if (withKeys.checked) pw.focus(); });
+  dialog({
+    title: L('Exportar perfil'),
+    sub: L('Provedores, modelos, rotas, orçamento, aparência e limites num arquivo. A senha do painel e o token do gateway não vão junto.'),
+    submitLabel: L('Exportar'),
+    body: h('div', { class: 'stack tight' }, h('label', { class: 'check' }, withKeys, L('Incluir as chaves de API, protegidas por uma senha')), secret),
+    submit: async () => {
+      if (withKeys.checked && pw.value.length < 8) throw new Error(L('A senha do backup precisa de 8 caracteres ou mais.'));
+      if (withKeys.checked && pw.value !== pw2.value) throw new Error(L('As senhas não são iguais.'));
+      const file = await api('POST', '/api/backup/export', withKeys.checked ? { password: pw.value } : {});
+      const d = new Date(), pad = (n) => String(n).padStart(2, '0');
+      saveFile(JSON.stringify(file, null, 2), `rotaz-perfil-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.json`);
+      toast(withKeys.checked ? L('Perfil exportado com as chaves') : L('Perfil exportado sem as chaves'));
+    },
+  });
+}
+
+/** Importar: escolhe o arquivo, confere e mostra o que vem nele antes de aplicar. */
+function pickProfile() {
+  const input = h('input', { type: 'file', accept: '.json,application/json', hidden: true });
+  input.addEventListener('change', async () => {
+    const f = input.files?.[0];
+    input.remove();
+    if (!f) return;
+    let file;
+    try { file = JSON.parse(await f.text()); } catch { toast(L('Este arquivo não é um backup do Rotaz.'), 'error'); return; }
+    try { importProfileDialog(file, await api('POST', '/api/backup/inspect', { file })); } catch (e) { fail(e); }
+  });
+  document.body.append(input);
+  input.click();
+}
+
+function importProfileDialog(file, info) {
+  let mode = 'replace';
+  const pw = h('input', { type: 'password', autocomplete: 'off' });
+  const modeHint = h('div', { class: 'hint' });
+  const paintMode = () => { modeHint.textContent = mode === 'replace'
+    ? L('Os provedores, rotas, orçamento, aparência e limites atuais são trocados pelos do arquivo.')
+    : L('Os provedores do arquivo entram junto com os atuais. Rotas, orçamento e aparência ficam como estão.'); };
+  paintMode();
+  const when = info.exportedAt ? new Date(info.exportedAt).toLocaleString(currentLang(), { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+  dialog({
+    title: L('Importar perfil'),
+    sub: L('Exportado em {0}', when),
+    submitLabel: L('Importar'),
+    body: h('div', { class: 'stack tight' },
+      h('div', { class: 'row' }, badge(L('{0} provedor(es)', info.providers)), badge(L('{0} modelo(s)', info.models)),
+        info.secrets ? badge(L('Chaves incluídas'), 'pos') : badge(L('Sem chaves'), 'warn')),
+      info.secrets && field(L('Senha do backup'), pw, L('Sem a senha, os provedores entram sem as chaves.')),
+      field(L('Como importar'), segmented([{ value: 'replace', label: L('Substituir tudo') }, { value: 'merge', label: L('Acrescentar provedores') }], mode, (v) => { mode = v; paintMode(); }, { label: L('Como importar') })),
+      modeHint),
+    submit: async () => {
+      const r = await api('POST', '/api/backup/import', { file, password: pw.value || undefined, mode });
+      toast(r.keysImported || !info.secrets ? L('Perfil importado') : L('Perfil importado sem as chaves'));
+      // tema, idioma e tudo o mais podem ter mudado: o painel recarrega já com o perfil novo
+      setTimeout(() => location.reload(), 600);
+    },
+  });
+  if (info.secrets) pw.focus();
+}
+
+async function aboutDialog() {
+  const { version } = await api('GET', '/api/auth/status').catch(() => ({}));
+  const link = (label, url) => h('a', { class: 'btn ghost sm', href: url, target: '_blank', rel: 'noopener noreferrer' }, label, icon('arrow-square-out'));
+  dialog({
+    title: L('Sobre o Rotaz'), info: true, submitLabel: L('Fechar'), submit: async () => {},
+    body: h('div', { class: 'about' },
+      wordmark('wm-auth'),
+      h('p', { class: 'small muted' }, version ? L('Versão {0}', version) : null),
+      h('p', {}, L('Gateway local que deixa o Claude Code usar modelos de outros provedores.')),
+      h('p', { class: 'small muted' }, L('Código aberto, licença MIT. Não é afiliado à Anthropic.')),
+      h('div', { class: 'row' }, link(L('Site'), SITE_URL), link('GitHub', REPO_URL), link(L('Documentação'), `${SITE_URL}/docs.html`))),
+  });
+}
 
 // ---------- autenticação ----------
 /**
@@ -464,7 +637,7 @@ function mountTitlebar() {
   desk.onMaximized(setMax);
   desk.isMaximized().then(setMax);
   document.body.prepend(h('header', { class: 'titlebar' },
-    h('div', { class: 'tb-brand' }, wordmark('wm-sm')),
+    brandButton('tb-brand', 'wm-sm'),
     h('span', { class: 'tb-page', id: 'tb-page' }),
     h('div', { class: 'grow' }),
     desk.platform !== 'darwin' && h('div', { class: 'tb-controls' },
@@ -487,7 +660,7 @@ function shell(status) {
   let on = status?.gatewayEnabled !== false;
   const dot = h('span', { class: 'dot' });
   const name = h('span', { class: 'ws-name' });
-  const paint = () => { dot.className = `dot ${on ? 'pos live' : 'warn'}`; name.textContent = on ? L('Gateway ativo') : L('Gateway desligado'); };
+  const paint = () => { dot.className = `dot ${on ? 'pos' : 'warn'}`; name.textContent = on ? L('Gateway ativo') : L('Gateway desligado'); };
   paint();
   const sw = toggle(on, async (v) => {
     try {
@@ -506,7 +679,7 @@ function shell(status) {
 
   root.replaceChildren(h('div', { class: 'shell' },
     h('nav', { class: 'sidebar', 'aria-label': L('Principal') },
-      h('div', { class: 'brand' }, wordmark('wm-md')),
+      brandButton('brand', 'wm-md'),
       h('div', { class: 'workspace' },
         h('div', { class: 'ws-top' }, dot, h('div', { class: 'ws-text' }, name, h('span', { class: 'ws-sub' }, status?.address ?? location.host)), sw),
         copyToken),
@@ -532,7 +705,15 @@ function paintNav() {
   }
 }
 
-function stopPolling() { clearInterval(state.timer); state.timer = null; }
+function stopPolling() { clearInterval(state.timer); state.timer = null; state.onVisible = null; }
+
+/** Atualização periódica que dorme com a janela escondida (bandeja, minimizada) e acorda na hora em que ela volta. */
+function poll(fn, ms) {
+  const tick = () => { if (!document.hidden) fn().catch(() => {}); };
+  state.timer = setInterval(tick, ms);
+  state.onVisible = tick;
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) state.onVisible?.(); });
 
 async function route() {
   stopPolling();
@@ -564,6 +745,7 @@ function providerStatus(p) {
 function statusLine(d) {
   if (d.server.gatewayEnabled === false) return L('O gateway está desligado: o Claude Code recebe erro 503 até você religá-lo na barra lateral.');
   if (!d.providers.length) return L('Nenhum provedor cadastrado ainda.');
+  if (!d.active && d.routeIssue?.reason === 'provider-off') return L('Sem rota ativa: o provedor do modelo padrão, {0}, está desligado.', d.routeIssue.provider.name);
   if (!d.active) return L('Nenhuma rota ativa: falta um provedor ligado com chave e modelo.');
   const failing = d.providers.filter((p) => providerStatus(p)[0] === L('Com falha'));
   if (failing.length) return L('{0} falhou na última chamada.', failing.map((p) => p.name).join(', '));
@@ -734,6 +916,75 @@ function growHills(container) {
 }
 
 // ---------- quadros da visão geral ----------
+/**
+ * Gasto em dinheiro: o mês em destaque, hoje, os últimos 30 dias em barras, os provedores que mais gastaram
+ * e o orçamento. Só conta modelos com preço cadastrado; os demais aparecem como aviso, com o caminho para cadastrar.
+ */
+/** Faixa no topo da visão geral quando o orçamento chega ao limite: diz o que está acontecendo com os pedidos. */
+function budgetNotice(sp) {
+  const b = sp?.budget;
+  if (!b?.over) return null;
+  const what = b.action === 'block' ? L('Os pedidos do Claude Code estão sendo recusados até o fim do período.')
+    : b.action === 'switch' ? L('Os pedidos estão indo para {0} até o fim do período.', b.fallbackAlias)
+    : L('Os pedidos continuam normalmente; só o aviso está ativo.');
+  return h('div', { class: 'budget-notice' }, notice(what, 'warn', L('Limite de gastos atingido')), h('a', { class: 'btn sm', href: '#/settings' }, L('Ajustar limite')));
+}
+
+function spendWidget(d) {
+  const sp = d.spend;
+  const cur = sp?.currency ?? 'USD';
+  const b = sp?.budget ?? {};
+  const priced = d.providers.some((p) => p.pricedModels > 0);
+  const status = b.over ? badge(L('Limite atingido'), 'neg') : b.warn ? badge(L('Perto do limite'), 'warn') : null;
+  if (!sp || !priced) {
+    return panel([L('Gasto'), L('Neste mês, nos modelos com preço')], null,
+      h('div', { class: 'empty-state' }, icon('chart-bar', 'lg'), L('Cadastre o preço dos modelos para ver quanto você gasta.'),
+        h('a', { class: 'btn', href: '#/providers' }, L('Abrir provedores'))));
+  }
+  const max = Math.max(...sp.days.map((x) => x.cost), 0);
+  const bars = h('div', { class: 'spend-bars', role: 'img', 'aria-label': L('Gasto por dia nos últimos 30 dias') }, sp.days.map((x) => {
+    const i = h('i', { 'data-tip': `${new Date(`${x.day}T12:00:00`).toLocaleDateString(currentLang(), { day: '2-digit', month: 'short' })} · ${money(x.cost, cur)}` });
+    i.style.setProperty('--h', max > 0 ? String(Math.max(x.cost > 0 ? 0.04 : 0, x.cost / max)) : '0');
+    return i;
+  }));
+  const limit = (label, pct, value, lim) => lim > 0 && h('div', { class: 'spend-limit' },
+    h('div', { class: 'row spread small' }, h('span', { class: 'muted' }, label), h('span', {}, L('{0} de {1}', money(value, cur), money(lim, cur)))),
+    meter(Math.min(100, pct ?? 0), pct >= 100 ? 'var(--d2)' : pct >= b.warnAt ? 'var(--d3)' : 'var(--d4)'));
+  const top = Object.entries(sp.byProvider).sort((x, y) => y[1] - x[1]).slice(0, 3)
+    .map(([id, v]) => [d.providers.find((p) => p.id === id)?.name ?? id, v]);
+  return panel([L('Gasto'), L('Neste mês, nos modelos com preço')], status,
+    h('div', { class: 'panel-body stack tight' },
+      h('div', { class: 'row spread spend-head' }, h('div', { class: 'hero' }, money(sp.month, cur)), h('div', { class: 'small muted' }, L('Hoje: {0}', money(sp.today, cur)))),
+      bars,
+      limit(L('Limite do dia'), b.dayPct, sp.today, b.daily),
+      limit(L('Limite do mês'), b.monthPct, sp.month, b.monthly),
+      top.length > 0 && h('div', { class: 'spend-top' }, top.map(([name, v]) => h('div', { class: 'row spread small' }, h('span', { class: 'ellipsis' }, name), h('span', {}, money(v, cur))))),
+      sp.unpricedMonth > 0 && h('a', { class: 'small muted spend-note', href: '#/providers' }, icon('info'), L('{0} pedido(s) deste mês sem preço cadastrado não entram na conta.', fmt(sp.unpricedMonth)))));
+}
+
+/** Sem rota ativa: diz o motivo (o servidor manda em `routeIssue`) e oferece a ação que resolve. */
+function routeEmpty(d) {
+  const add = h('a', { class: 'btn primary', href: '#/providers/new' }, L('Adicionar provedor'));
+  const pick = (primary) => h('a', { class: `btn ${primary ? 'primary' : 'ghost'}`, href: '#/routing' }, L(primary ? 'Escolher modelo padrão' : 'Escolher outro modelo'));
+  const fix = (label) => h('a', { class: 'btn primary', href: '#/providers' }, label);
+  const x = d.routeIssue ?? { reason: 'no-default' };
+  const name = x.provider?.name ?? '';
+  let text, actions;
+  if (!d.providers.length) [text, actions] = [L('Nenhuma rota ativa ainda.'), [add]];
+  else if (x.reason === 'provider-off') {
+    const on = button(L('Ligar {0}', name), async () => {
+      on.disabled = true;
+      try { await api('PUT', `/api/providers/${x.provider.id}`, { enabled: true }); toast(L('{0} ligado', name)); } catch (e) { fail(e); }
+      route();
+    }, 'primary');
+    [text, actions] = [L('O modelo padrão, {0}, é do provedor {1}, que está desligado.', x.alias, name), [on, pick(false)]];
+  } else if (x.reason === 'no-key') [text, actions] = [L('O modelo padrão, {0}, é do provedor {1}, que está sem chave ativa.', x.alias, name), [fix(L('Abrir provedores')), pick(false)]];
+  else if (x.reason === 'model-off') [text, actions] = [L('O modelo padrão, {0}, está desativado.', x.alias), [fix(L('Abrir provedores')), pick(false)]];
+  else if (x.reason === 'missing') [text, actions] = [L('O modelo padrão, {0}, não existe mais.', x.alias), [pick(true)]];
+  else [text, actions] = [L('Nenhum modelo padrão escolhido.'), [pick(true)]];
+  return h('div', { class: 'empty-state' }, h('div', {}, text), h('div', { class: 'row wrap' }, actions));
+}
+
 function overviewParts(d) {
   const okRate = d.stats.requests ? ((d.stats.requests - d.stats.errors) / d.stats.requests) * 100 : null;
   const totalReq = Math.max(1, d.providers.reduce((a, p) => a + p.requests, 0));
@@ -748,7 +999,7 @@ function overviewParts(d) {
       h('div', { class: 'chain' }, icon('stack'), d.active.chain?.length
         ? [L('Se falhar, tenta'), ...d.active.chain.map((c) => badge(`${c.provider} · ${c.upstream}`))]
         : L('Sem alternativa de fallback para este alias.')))
-      : h('div', { class: 'empty-state' }, L('Nenhuma rota ativa ainda.'), h('a', { class: 'btn primary', href: d.providers.length ? '#/routing' : '#/providers/new' }, d.providers.length ? L('Escolher modelo padrão') : L('Adicionar provedor'))));
+      : routeEmpty(d));
 
   const healthPanel = panel([L('Taxa de sucesso'), L('Desde que o gateway iniciou')], null,
     h('div', { class: 'panel-body stack tight' },
@@ -786,9 +1037,12 @@ function overviewParts(d) {
   const latAvg = latList.length ? Math.round(latList.reduce((a, p) => a + p.avgLatencyMs * p.requests, 0) / Math.max(1, latList.reduce((a, p) => a + p.requests, 0))) : 0;
   const pct = (v, t) => `${Math.round((v / Math.max(1, t)) * 100)}%`;
 
+  const spendPanel = spendWidget(d);
+
   return {
     route: routePanel,
     success: healthPanel,
+    spend: spendPanel,
     stats: h('section', { class: 'panel stats', 'aria-label': L('Totais') },
       stat(L('Requisições'), d.stats.requests, d.server.inflight ? L('{0} em andamento', d.server.inflight) : L('nenhuma em andamento'), { format: compact }),
       stat(L('Latência média'), d.stats.avgLatencyMs, L('até a resposta completa'), { format: ms }),
@@ -814,6 +1068,7 @@ function overviewParts(d) {
 const WIDGETS = {
   route: { title: LK('Rota ativa'), def: 8, min: 4 },
   success: { title: LK('Taxa de sucesso'), def: 4, min: 3 },
+  spend: { title: LK('Gasto'), def: 5, min: 4 },
   stats: { title: LK('Totais'), def: 12, min: 4 },
   requestsHills: { title: LK('Requisições por provedor'), def: 12, min: 5 },
   tokensHills: { title: LK('Tokens por provedor'), def: 6, min: 5 },
@@ -823,7 +1078,7 @@ const WIDGETS = {
   recent: { title: LK('Requisições recentes'), def: 7, min: 5 },
   errors: { title: LK('Erros recentes'), def: 5, min: 3 },
 };
-const DEFAULT_LAYOUT = [['route', 8], ['success', 4], ['stats', 12], ['requestsHills', 12], ['traffic', 7], ['providers', 5], ['recent', 7], ['errors', 5]].map(([id, span]) => ({ id, span }));
+const DEFAULT_LAYOUT = [['route', 8], ['success', 4], ['stats', 12], ['spend', 5], ['requestsHills', 7], ['traffic', 7], ['providers', 5], ['recent', 7], ['errors', 5]].map(([id, span]) => ({ id, span }));
 /*
  * Encaixe automático: a grade tem 12 colunas e cada linha fica sempre cheia, sem buraco à direita.
  * As linhas saem da mesma regra do CSS grid (um quadro que não cabe desce para a próxima linha).
@@ -992,22 +1247,29 @@ async function overview(sheet) {
       grid.append(el);
     }
     if (!layout.length) grid.append(h('div', { class: 'widget dash-empty' }, h('div', { class: 'empty-state' }, L('Nenhum quadro na visão geral.'), button(L('Adicionar quadro'), (e) => menu(e.currentTarget, hidden.map((id) => ({ label: L(WIDGETS[id].title), icon: 'plus', onClick: () => { layout.push({ id, span: WIDGETS[id].def }); commit(); } }))), 'primary', { icon: 'plus' }))));
-    page.replaceChildren(
+    page.replaceChildren(...[
       pageHead(L('Visão geral'), editing ? L('Arraste pela alça para reordenar; as linhas se ajustam sozinhas. A borda direita divide a largura.') : statusLine(data), actions),
-      grid);
+      budgetNotice(data.spend),
+      grid].filter(Boolean));
     if (!first) for (const v of page.querySelectorAll('.value[data-count]')) v.removeAttribute('data-count');
     requestAnimationFrame(() => layoutLabels(page));
   }
 
+  // Assinatura do que aparece na tela: o tempo ativo conta em minutos e a memória do processo não aparece.
+  // Sem mudança, a tela fica como está (redesenhar tudo a cada 4 s custava processamento à toa).
+  let sig = '';
   const draw = async (first) => {
     const d = await api('GET', '/api/dashboard');
     if (state.view !== 'overview' || (editing && !first)) return; // não redesenha no meio de uma edição
+    const next = JSON.stringify({ ...d, server: { ...d.server, uptimeMs: Math.floor(d.server.uptimeMs / 60000), rssMB: 0 } });
+    if (!first && next === sig) return;
+    sig = next;
     data = d;
     render(first);
   };
   await loadPresets().catch(() => {});
   await draw(true);
-  state.timer = setInterval(() => draw(false).catch(() => {}), 4000);
+  poll(() => draw(false), 4000);
 }
 
 // ---------- provedores: utilidades ----------
@@ -1177,14 +1439,61 @@ async function presetSetup(sheet, presetId) {
 }
 
 // ---------- provedores: detalhe ----------
-function compatBadge(c) {
-  return c.desktop ? null : badge(L('Só CLI'), 'warn', L('O seletor do Claude Desktop descarta ids que contêm "{0}". No terminal funciona.', c.blockedBy));
+// ---------- alias: onde o nome aparece ----------
+const quoteTerms = (t) => t.map((x) => `"${x}"`).join(', ');
+function aliasProblem(a) {
+  return {
+    empty: L('Dê um nome depois de "claude-".'),
+    prefix: L('Comece com "claude-": o Claude Code só lista modelos com esse prefixo.'),
+    chars: L('Use só letras minúsculas, números, ponto, hífen ou sublinhado.'),
+    length: L('Use até 64 caracteres.'),
+    taken: L('Este nome já existe neste provedor.'),
+  }[a.problem] ?? '';
+}
+/** Selo de onde o alias aparece: no Claude Code do terminal e no seletor do Claude Desktop, ou só no terminal. */
+function reachBadge(alias, suggestion, { strong = false } = {}) {
+  const a = analyzeAlias(alias);
+  if (!a.valid) return badge(L('Nome inválido'), 'neg', aliasProblem(a));
+  if (a.desktop) return badge(L('CLI e Desktop'), strong ? 'pos' : '', L('Aparece no Claude Code do terminal e no seletor do Claude Desktop.'));
+  return badge(L('Só CLI'), 'warn', suggestion
+    ? L('Funciona no terminal. O seletor do Claude Desktop esconde nomes com {0}; "{1}" funciona nos dois.', quoteTerms(a.blocked), suggestion)
+    : L('Funciona no terminal. O seletor do Claude Desktop esconde nomes com {0}.', quoteTerms(a.blocked)));
 }
 
-function modelDialog(p, m, discovered = [], isDefault = false) {
+/**
+ * Diagnóstico ao vivo do campo de alias e nomes que funcionam no CLI e no Desktop, com um clique para usar.
+ * `upstream`: campo do identificador real (as sugestões também partem dele). `original`: nome antes de editar.
+ */
+function aliasAssist(input, { upstream, taken, original, onPick } = {}) {
+  const status = h('div', { class: 'alias-status', role: 'status' });
+  const picks = h('div', { class: 'alias-picks' });
+  const paint = () => {
+    const a = analyzeAlias(input.value, { taken });
+    let mark, text;
+    if (a.problem) { mark = badge(a.problem === 'taken' ? L('Em uso') : L('Nome inválido'), 'neg'); text = aliasProblem(a); }
+    else if (a.desktop) { mark = badge(L('CLI e Desktop'), 'pos'); text = L('Aparece no Claude Code do terminal e no seletor do Claude Desktop. O provedor recebe o identificador real.'); }
+    else { mark = badge(L('Só CLI'), 'warn'); text = L('Funciona no terminal, mas o seletor do Claude Desktop esconde nomes com {0}.', quoteTerms(a.blocked)); }
+    if (original && !a.problem && a.alias !== original) text += ` ${L('Ao salvar, o roteamento passa para o nome novo; se você fixou o nome antigo no Claude Code, troque lá também.')}`;
+    status.replaceChildren(mark, h('span', {}, text));
+    const list = a.desktop && !a.problem ? [] : aliasSuggestions(input.value, { upstream: upstream?.value, taken });
+    picks.hidden = !list.length;
+    picks.replaceChildren(...(list.length ? [h('span', { class: 'small muted' }, L('Funcionam nos dois:')), ...list.map((sg) => button(sg.alias, () => {
+      input.value = sg.alias;
+      onPick?.(sg.alias);
+      input.dispatchEvent(new Event('input'));
+      input.focus();
+    }, 'sm mono', { 'data-tip': sg.changes.length ? sg.changes.map((c) => `${c.from} → ${c.to}`).join(' · ') : undefined }))] : []));
+  };
+  input.addEventListener('input', paint);
+  upstream?.addEventListener('input', paint);
+  paint();
+  return h('div', { class: 'alias-assist full' }, status, picks);
+}
+
+function modelDialog(p, m, discovered = [], isDefault = false, { alias: presetAlias } = {}) {
   const makeDefault = h('input', { type: 'checkbox', checked: isDefault, disabled: isDefault });
   let dlg;
-  const alias = h('input', { type: 'text', value: m?.alias ?? state.aliasHint ?? 'claude-', required: true, spellcheck: 'false', autocomplete: 'off' });
+  const alias = h('input', { type: 'text', value: presetAlias ?? m?.alias ?? state.aliasHint ?? 'claude-', required: true, spellcheck: 'false', autocomplete: 'off' });
   const listId = 'discovered-models';
   const upstream = h('input', { type: 'text', value: m?.upstream ?? '', required: true, spellcheck: 'false', list: listId, autocomplete: 'off' });
   const datalist = h('datalist', { id: listId }, discovered.map((x) => h('option', { value: x })));
@@ -1197,15 +1506,20 @@ function modelDialog(p, m, discovered = [], isDefault = false) {
   effort.value = m?.reasoningEffort ?? '';
   const param = h('select', {}, ['auto', 'max_tokens', 'max_completion_tokens'].map((v) => h('option', { value: v }, v)));
   param.value = m?.tokenParam ?? 'auto';
-  const hint = h('div', { class: 'hint' });
-  const updateHint = () => {
-    const bad = window.DESKTOP_DENY?.exec(alias.value.toLowerCase())?.[0];
-    hint.textContent = bad ? L('O seletor do Claude Desktop descarta ids com "{0}". Funciona no terminal.', bad) : L('Nome público que o Claude Code vê. O provedor recebe o identificador real.');
-  };
-  alias.addEventListener('input', updateHint);
-  updateHint();
+  const priceIn = h('input', { type: 'number', min: 0, step: 'any', value: m?.priceIn ?? '', placeholder: L('Sem preço') });
+  const priceOut = h('input', { type: 'number', min: 0, step: 'any', value: m?.priceOut ?? '', placeholder: L('Sem preço') });
+  // Nomes deste provedor (o mesmo alias em outro provedor é permitido: vira reserva).
+  const taken = new Set(p.models.filter((x) => x.id !== m?.id).map((x) => x.alias));
+  // Ao adicionar, o alias acompanha o identificador real até a pessoa mexer nele.
+  let follow = !m && !presetAlias && /^(claude-?)?$/.test(alias.value);
+  alias.addEventListener('input', (e) => { if (e.isTrusted) follow = false; });
+  upstream.addEventListener('input', () => {
+    if (!follow || !upstream.value.trim()) return;
+    alias.value = bestAlias(upstream.value, new Set(taken));
+    alias.dispatchEvent(new Event('input'));
+  });
   const f = field(L('Alias'), alias, null, 'full');
-  f.append(hint);
+  f.append(aliasAssist(alias, { upstream, taken, original: m?.alias, onPick: () => { follow = false; } }));
   dlg = dialog({
     title: m ? L('Editar {0}', m.alias) : L('Adicionar modelo em {0}', p.name),
     body: h('div', { class: 'form-grid' }, f,
@@ -1213,9 +1527,11 @@ function modelDialog(p, m, discovered = [], isDefault = false) {
       field(L('Nome de exibição'), display), field(L('Limite de saída (tokens)'), maxOut, L('Reduz o max_tokens do Claude Code quando preciso.')),
       field(L('Imagens'), images, m?.learnedMaxImages !== null && m?.learnedMaxImages !== undefined ? (m.learnedMaxImages === 0 ? L('Detectado pelo erro do provedor: não aceita imagens. Salvar substitui a detecção.') : L('Detectado pelo erro do provedor: no máximo {0}. Salvar substitui a detecção.', m.learnedMaxImages)) : L('Imagens acima do limite viram um aviso em texto; as mais recentes ficam.'), 'full'),
       p.type === 'openai' && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
+      field(L('Preço de entrada (US$ por 1M de tokens)'), priceIn), field(L('Preço de saída (US$ por 1M de tokens)'), priceOut),
+      h('div', { class: 'hint full' }, L('Está na página de preços do provedor. Vazio, o gasto deste modelo não é contado; modelos locais custam 0.')),
       h('label', { class: 'check full' }, makeDefault, L('Usar como modelo padrão'))),
     submit: async () => {
-      const saved = await api('POST', `/api/providers/${p.id}/models`, { id: m?.id, alias: alias.value, upstream: upstream.value, displayName: display.value, maxOutputTokens: maxOut.value ? Number(maxOut.value) : null, maxImages: images.value === '' ? null : Number(images.value), imagesTouched: true, reasoningEffort: effort.value || null, tokenParam: param.value });
+      const saved = await api('POST', `/api/providers/${p.id}/models`, { id: m?.id, alias: alias.value, upstream: upstream.value, displayName: display.value, maxOutputTokens: maxOut.value ? Number(maxOut.value) : null, maxImages: images.value === '' ? null : Number(images.value), imagesTouched: true, priceIn: priceIn.value === '' ? null : Number(priceIn.value), priceOut: priceOut.value === '' ? null : Number(priceOut.value), reasoningEffort: effort.value || null, tokenParam: param.value });
       if (makeDefault.checked && !isDefault) await api('PUT', '/api/routing', { defaultAlias: saved.alias });
       state.aliasHint = null;
       route();
@@ -1233,7 +1549,7 @@ function keyDialog(p) {
 
 function testResult(r) {
   if (!r) return null;
-  if (r.running) return h('div', { class: 'result', role: 'status' }, h('div', { class: 'r-head' }, icon('circle-notch', 'spinner'), h('span', {}, L('Testando {0} com uma requisição real…', r.what))));
+  if (r.running) return h('div', { class: 'result', role: 'status' }, h('div', { class: 'r-head' }, icon('circle-notch', 'spinner'), h('span', { class: 'grow' }, L('Testando {0} com uma requisição real…', r.what)), r.stop && button(L('Interromper'), r.stop, 'ghost sm')));
   const ok = r.status === 'functional';
   return h('div', { class: 'result', role: 'status' },
     h('div', { class: 'r-head' }, badge(r.label, ok ? (r.toolsOk === false ? 'warn' : 'pos') : 'neg'),
@@ -1244,9 +1560,13 @@ function testResult(r) {
 }
 
 async function runTest(p, opts, what) {
-  state.tests[p.id] = { running: true, what };
+  const ctrl = new AbortController();
+  const t = state.tests[p.id] = { running: true, what, stop: () => ctrl.abort() };
   redrawDetail();
-  try { state.tests[p.id] = await api('POST', `/api/providers/${p.id}/test`, opts); } catch (e) { state.tests[p.id] = null; fail(e); }
+  try { state.tests[p.id] = await api('POST', `/api/providers/${p.id}/test`, opts, { signal: ctrl.signal }); } catch (e) {
+    if (state.tests[p.id] === t) state.tests[p.id] = null;
+    if (!ctrl.signal.aborted) fail(e); else toast(L('Teste interrompido.'));
+  }
   redrawDetail();
 }
 
@@ -1306,16 +1626,6 @@ function imagesBadge(m) {
 // ---------- modelos em massa ----------
 const selOf = (pid) => (state.sel[pid] ??= new Set());
 
-function suggestAlias(upstream, taken) {
-  const piece = upstream.toLowerCase().replace(/^models\//, '').replace(/[^a-z0-9._-]+/g, '-').replace(/-{2,}/g, '-').replace(/^[-._]+|[-._]+$/g, '');
-  let base = /^claude-[a-z0-9]/.test(piece) ? piece : `claude-${piece}`;
-  base = base.slice(0, 64).replace(/[-._]+$/, '');
-  if (!/^claude-[a-z0-9]/.test(base)) base = 'claude-modelo';
-  let a = base;
-  for (let n = 2; taken.has(a); n++) a = `${base.slice(0, 60)}-${n}`;
-  taken.add(a);
-  return a;
-}
 
 function latestTest(m) {
   const a = state.live[m.id];
@@ -1333,33 +1643,106 @@ function testBadge(t) {
   return badge(text, ok ? (t.toolsOk === false ? 'warn' : 'pos') : 'neg', `${t.message ?? ''}${t.at ? ` (${ago(t.at)})` : ''}`);
 }
 
-async function bulkTest(p, ids, full) {
-  if (state.bulk || !ids.length) return;
-  const run = state.bulk = { pid: p.id, total: ids.length, done: 0, ok: 0, fail: 0, cancel: false };
-  const queue = [...ids];
-  for (const id of ids) state.live[id] = { running: true };
+// Células da coluna "Último teste" e o texto do progresso, para o teste em massa atualizar só o que mudou.
+const live = { cells: new Map(), label: null };
+const progressText = (run) => L('Testando {0} de {1}: {2} respondendo, {3} com falha', run.done, run.total, run.ok, run.fail);
+
+/**
+ * Testes de modelos em fila, um conjunto por provedor. Pode chamar de novo durante um teste: os modelos novos
+ * entram na mesma fila. Interromper cancela a fila e também o que já está no servidor.
+ */
+function bulkTest(p, ids, full) {
+  ids = ids.filter((id) => !state.live[id]?.running);
+  if (!ids.length) return;
+  const run = state.runs.get(p.id) ?? newRun(p);
+  run.queue.push(...ids.map((id) => ({ id, full })));
+  run.total += ids.length;
+  run.full ||= full;
+  for (const id of ids) { run.ids.add(id); state.live[id] = { running: true }; }
   redrawDetail();
-  const worker = async () => {
-    while (queue.length && !run.cancel) {
-      const id = queue.shift();
-      try {
-        const r = await api('POST', `/api/providers/${p.id}/test`, { modelId: id, quick: !full });
-        state.live[id] = r;
-        if (r.status === 'functional') run.ok++; else run.fail++;
-      } catch (e) {
-        state.live[id] = { status: 'error', label: L('Erro'), message: e.message, at: Date.now() };
-        run.fail++;
-      }
-      run.done++;
-      redrawDetail();
+  run.pump();
+}
+
+function newRun(p) {
+  const ctrl = new AbortController();
+  const run = { pid: p.id, name: p.name, total: 0, done: 0, ok: 0, fail: 0, active: 0, full: false, cancel: false, ended: false, queue: [], ids: new Set(), dirty: new Set(), frame: 0 };
+  state.runs.set(p.id, run);
+  // Redesenhar a tela inteira a cada resultado travava listas grandes: muda só a célula do modelo e a contagem,
+  // agrupadas num quadro de animação.
+  const flush = () => {
+    run.frame = 0;
+    for (const id of run.dirty) { const c = live.cells.get(id); c?.cell.replaceChildren(testBadge(latestTest(c.m))); }
+    run.dirty.clear();
+    if (live.label && state.runs.get(state.provider) === run) live.label.textContent = progressText(run);
+  };
+  const mark = (id) => { run.dirty.add(id); run.frame ||= requestAnimationFrame(flush); };
+  const finish = () => {
+    if (run.ended || (run.active && !run.cancel) || (run.queue.length && !run.cancel)) return;
+    run.ended = true;
+    cancelAnimationFrame(run.frame);
+    for (const id of run.ids) if (state.live[id]?.running) delete state.live[id];
+    state.runs.delete(p.id);
+    toast(run.cancel ? L('{0} testado(s): {1} respondendo, {2} com falha. Teste interrompido.', run.done, run.ok, run.fail) : L('{0} testado(s): {1} respondendo, {2} com falha.', run.done, run.ok, run.fail), run.fail ? 'error' : 'info');
+    if (state.view === 'providers') redrawDetail();
+  };
+  const one = async ({ id, full }) => {
+    try {
+      const r = await api('POST', `/api/providers/${p.id}/test`, { modelId: id, quick: !full }, { signal: ctrl.signal });
+      if (run.cancel) return;
+      state.live[id] = r;
+      if (r.status === 'functional') run.ok++; else run.fail++;
+    } catch (e) {
+      if (run.cancel) return;
+      state.live[id] = { status: 'error', label: L('Erro'), message: e.message, at: Date.now() };
+      run.fail++;
+    }
+    run.done++;
+    mark(id);
+  };
+  // Rápido: quatro por vez; com teste completo na fila, dois (cada um faz três chamadas). O servidor ainda respeita
+  // o limite por minuto de cada provedor, e cada teste tem prazo total, então nenhum fica preso.
+  run.pump = () => {
+    while (!run.cancel && run.queue.length && run.active < (run.full ? 2 : 4)) {
+      run.active++;
+      one(run.queue.shift()).finally(() => { run.active--; run.pump(); finish(); });
     }
   };
-  // Duas por vez: rápido sem estourar o limite dos provedores (a fila do servidor também ajuda).
-  await Promise.all(Array.from({ length: Math.min(2, ids.length) }, worker));
-  for (const id of queue) delete state.live[id];
-  state.bulk = null;
-  toast(run.cancel ? L('{0} testado(s): {1} respondendo, {2} com falha. Teste interrompido.', run.done, run.ok, run.fail) : L('{0} testado(s): {1} respondendo, {2} com falha.', run.done, run.ok, run.fail), run.fail ? 'error' : 'info');
-  route();
+  // Interromper responde na hora: a fila some, as chamadas em andamento são canceladas no navegador e no servidor.
+  run.stop = () => {
+    if (run.cancel) return;
+    run.cancel = true;
+    run.queue = [];
+    ctrl.abort();
+    finish();
+  };
+  return run;
+}
+
+/** Renomeia os aliases "Só CLI" escolhidos para nomes que aparecem também no Claude Desktop. */
+function fixForDesktop(p, ids, routing) {
+  const names = new Set(p.models.map((x) => x.alias));
+  const plan = [];
+  for (const m of p.models.filter((x) => ids.includes(x.id) && !analyzeAlias(x.alias).desktop)) {
+    names.delete(m.alias);
+    const to = aliasSuggestions(m.alias, { upstream: m.upstream, taken: names, max: 1 })[0]?.alias;
+    names.add(to ?? m.alias);
+    if (to) plan.push({ m, to });
+  }
+  if (!plan.length) return;
+  const pinned = plan.some(({ m }) => m.alias === routing.defaultAlias || Object.values(routing.tiers ?? {}).includes(m.alias));
+  dialog({
+    title: L('Ajustar {0} alias(es) para o Desktop', plan.length), submitLabel: L('Renomear'),
+    sub: L('Os nomes novos aparecem no Claude Code do terminal e no seletor do Claude Desktop.'),
+    body: h('div', { class: 'stack tight' },
+      h('div', { class: 'rename-list' }, plan.map(({ m, to }) => h('div', { class: 'rename-row' }, h('span', { class: 'mono ellipsis muted', 'data-tip': m.alias }, m.alias), icon('arrow-right'), h('span', { class: 'mono ellipsis', 'data-tip': to }, to)))),
+      pinned && notice(L('O roteamento acompanha os nomes novos. Se você fixou algum nome antigo no Claude Code, troque lá também.'), 'accent')),
+    submit: async () => {
+      for (const { m, to } of plan) await api('POST', `/api/providers/${p.id}/models`, { ...m, alias: to });
+      toast(L('{0} alias(es) renomeado(s)', plan.length));
+      selOf(p.id).clear();
+      route();
+    },
+  });
 }
 
 async function bulkUpdate(p, ids, set, on) {
@@ -1373,19 +1756,24 @@ function bulkEditDialog(p, ids) {
   const effort = h('select', {}, h('option', { value: 'keep' }, L('Manter como está')), h('option', { value: '' }, L('Não enviar')), ['minimal', 'low', 'medium', 'high'].map((v) => h('option', { value: v }, v)));
   const param = h('select', {}, h('option', { value: 'keep' }, L('Manter como está')), ['auto', 'max_tokens', 'max_completion_tokens'].map((v) => h('option', { value: v }, v)));
   const images = imageSelect(true);
+  const priceIn = h('input', { type: 'number', min: 0, step: 'any', placeholder: L('Manter como está') });
+  const priceOut = h('input', { type: 'number', min: 0, step: 'any', placeholder: L('Manter como está') });
   dialog({
     title: L('Editar {0} modelo(s)', ids.length), sub: L('Só os campos alterados são aplicados. Alias e identificador real continuam individuais.'),
     submitLabel: L('Aplicar'),
     body: h('div', { class: 'form-grid' },
       field(L('Limite de saída (tokens)'), maxOut), h('label', { class: 'check' }, noLimit, L('Remover o limite')),
       field(L('Imagens'), images, null, 'full'),
-      p.type === 'openai' && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param)),
+      p.type === 'openai' && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
+      field(L('Preço de entrada (US$ por 1M de tokens)'), priceIn), field(L('Preço de saída (US$ por 1M de tokens)'), priceOut)),
     submit: async () => {
       const set = {};
       if (noLimit.checked) set.maxOutputTokens = null; else if (maxOut.value) set.maxOutputTokens = Number(maxOut.value);
       if (p.type === 'openai' && effort.value !== 'keep') set.reasoningEffort = effort.value || null;
       if (p.type === 'openai' && param.value !== 'keep') set.tokenParam = param.value;
       if (images.value !== 'keep') set.maxImages = images.value === '' ? null : Number(images.value);
+      if (priceIn.value !== '') set.priceIn = Number(priceIn.value);
+      if (priceOut.value !== '') set.priceOut = Number(priceOut.value);
       if (!Object.keys(set).length) throw new Error(L('Altere ao menos um campo.'));
       await api('POST', `/api/providers/${p.id}/models/bulk-update`, { ids, set });
       toast(L('{0} modelo(s) atualizado(s)', ids.length));
@@ -1400,6 +1788,15 @@ async function importDialog(p, refresh = false) {
   try { data = await api('POST', `/api/providers/${p.id}/discover`, { refresh }); } catch (e) { fail(e); return; }
   const existing = new Map(p.models.map((m) => [m.upstream, m.alias]));
   const taken = new Set(state.aliases);
+  // 'both': nomes que aparecem no CLI e no Desktop (padrão). 'plain': o nome do provedor, só com o prefixo.
+  let naming = 'both';
+  const plainAlias = (id, used) => {
+    let a = `claude-${id.toLowerCase().replace(/^models\//, '').replace(/[^a-z0-9._-]+/g, '-').replace(/-{2,}/g, '-').replace(/^[-._]+|[-._]+$/g, '')}`.slice(0, 64).replace(/[-._]+$/, '');
+    for (let n = 2; used.has(a); n++) a = `${a.slice(0, 60)}-${n}`;
+    used.add(a);
+    return a;
+  };
+  const nameFor = (id, used) => (naming === 'both' ? bestAlias(id, used) : plainAlias(id, used));
   const rows = [];
   const counter = h('span', { class: 'small muted' });
   let dlg;
@@ -1414,17 +1811,22 @@ async function importDialog(p, refresh = false) {
   for (const id of data.models) {
     const already = existing.get(id);
     const cb = h('input', { type: 'checkbox', disabled: !!already, 'aria-label': L('Selecionar {0}', id) });
-    const alias = h('input', { type: 'text', class: 'compact', value: already ?? suggestAlias(id, taken), disabled: !!already, spellcheck: 'false', 'aria-label': L('Alias de {0}', id) });
+    const alias = h('input', { type: 'text', class: 'compact', value: already ?? nameFor(id, taken), disabled: !!already, spellcheck: 'false', 'aria-label': L('Alias de {0}', id) });
     const cell = h('span');
+    const row = { id, cb, alias, already, edited: false };
     const paint = () => {
-      const bad = window.DESKTOP_DENY.exec(alias.value.toLowerCase())?.[0];
-      cell.replaceChildren(already ? badge(L('Já adicionado')) : bad ? badge(L('Só CLI'), 'warn', L('O seletor do Desktop descarta ids com "{0}". Funciona no terminal.', bad)) : badge(L('CLI e Desktop'), 'pos'));
+      cell.replaceChildren(already ? badge(L('Já adicionado')) : reachBadge(alias.value, analyzeAlias(alias.value).desktop ? null : aliasSuggestions(alias.value, { upstream: id, taken, max: 1 })[0]?.alias, { strong: true }));
     };
-    alias.addEventListener('input', () => { paint(); if (!cb.checked && !already) { cb.checked = true; update(); } });
+    row.paint = paint;
+    alias.addEventListener('input', (e) => { if (e.isTrusted) row.edited = true; paint(); if (!cb.checked && !already) { cb.checked = true; update(); } });
     cb.addEventListener('change', update);
     paint();
-    const tr = h('tr', { 'data-q': `${id} ${alias.value}`.toLowerCase() }, h('td', { class: 'chk' }, cb), h('td', { class: 'mono ellipsis', 'data-tip': id }, id), h('td', {}, alias), h('td', {}, cell));
-    rows.push({ id, cb, alias, tr, already });
+    const pr = data.prices?.[id];
+    const idCell = h('td', { class: 'ellipsis', 'data-tip': id }, h('div', { class: 'mono ellipsis' }, id),
+      pr && h('div', { class: 'small muted' }, L('{0} · {1} por 1M de tokens', money(pr.in ?? 0), money(pr.out ?? 0))));
+    const tr = h('tr', { 'data-q': `${id} ${alias.value}`.toLowerCase() }, h('td', { class: 'chk' }, cb), idCell, h('td', {}, alias), h('td', {}, cell));
+    row.tr = tr;
+    rows.push(row);
     tbody.append(tr);
   }
   const input = h('input', { type: 'search', placeholder: L('Filtrar por nome, ex.: llama 70b instruct'), 'aria-label': L('Filtrar modelos do provedor') });
@@ -1437,6 +1839,12 @@ async function importDialog(p, refresh = false) {
   const maxOut = h('input', { type: 'number', min: 1, placeholder: L('Sem limite') });
   const effort = h('select', {}, h('option', { value: '' }, L('Não enviar')), ['minimal', 'low', 'medium', 'high'].map((v) => h('option', { value: v }, v)));
   const testAfter = h('input', { type: 'checkbox', checked: true });
+  // Trocar o estilo refaz os nomes que a pessoa não editou à mão.
+  const namingCtl = segmented([{ value: 'both', label: L('Funcionam no CLI e no Desktop') }, { value: 'plain', label: L('Iguais ao provedor') }], naming, (v) => {
+    naming = v;
+    const used = new Set([...state.aliases, ...rows.filter((r) => r.already || r.edited).map((r) => r.alias.value)]);
+    for (const r of rows) if (!r.already && !r.edited) { r.alias.value = nameFor(r.id, used); r.tr.dataset.q = `${r.id} ${r.alias.value}`.toLowerCase(); r.paint(); }
+  }, { label: L('Nomes dos aliases') });
   dlg = dialog({
     title: L('Importar modelos de {0}', p.name), sub: data.cached ? L('Lista guardada {0}.', ago(data.at)) : L('Lista recém-buscada no provedor.'),
     wide: true, submitLabel: L('Adicionar'),
@@ -1444,6 +1852,8 @@ async function importDialog(p, refresh = false) {
       h('div', { class: 'row' }, h('div', { class: 'search grow' }, icon('magnifying-glass'), input),
         button(L('Marcar visíveis'), () => pick(true), 'ghost'), button(L('Desmarcar'), () => pick(false), 'ghost'),
         button(L('Atualizar lista'), () => { dlg.close(); dlg.remove(); importDialog(p, true); }, 'ghost', { icon: 'arrows-clockwise' })),
+      h('div', { class: 'row wrap import-naming' }, h('span', { class: 'small muted' }, L('Nomes:')), namingCtl,
+        h('span', { class: 'small muted grow' }, L('O seletor do Claude Desktop esconde nomes que citam outros fornecedores; no CLI, qualquer nome com "claude-" funciona.'))),
       counter,
       h('div', { class: 'import-list' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'chk' }), h('th', {}, L('Modelo real')), h('th', {}, L('Alias')), h('th', {}, L('Disponível em')))), tbody)),
       h('div', { class: 'form-grid' },
@@ -1454,7 +1864,8 @@ async function importDialog(p, refresh = false) {
       const chosen = rows.filter((r) => r.cb.checked);
       if (!chosen.length) throw new Error(L('Selecione ao menos um modelo.'));
       const { models } = await api('POST', `/api/providers/${p.id}/models/bulk`, {
-        models: chosen.map((r) => ({ alias: r.alias.value.trim().toLowerCase(), upstream: r.id, maxOutputTokens: maxOut.value ? Number(maxOut.value) : null, reasoningEffort: effort.value || null })),
+        models: chosen.map((r) => ({ alias: r.alias.value.trim().toLowerCase(), upstream: r.id, maxOutputTokens: maxOut.value ? Number(maxOut.value) : null, reasoningEffort: effort.value || null,
+          priceIn: data.prices?.[r.id]?.in ?? null, priceOut: data.prices?.[r.id]?.out ?? null })),
       });
       toast(L('{0} modelo(s) adicionado(s)', models.length));
       await route();
@@ -1469,19 +1880,28 @@ function modelsPanel(p, routing) {
   const sel = selOf(p.id);
   for (const id of [...sel]) if (!p.models.some((m) => m.id === id)) sel.delete(id);
   const q = (state.mfilter[p.id] ?? '').toLowerCase();
-  const busy = !!state.bulk;
   const setDefault = async (m) => { await api('PUT', '/api/routing', { defaultAlias: m.alias }).catch(fail); toast(L('Modelo padrão: {0}', m.alias)); route(); };
+  const names = new Set(p.models.map((x) => x.alias));
+  live.cells = new Map();
+  live.label = null;
   const rows = p.models.map((m) => {
+    // Só CLI: o primeiro nome que funciona nos dois vai no selo e no menu (Renomear para o Desktop).
+    const fix = analyzeAlias(m.alias).desktop ? null : aliasSuggestions(m.alias, { upstream: m.upstream, taken: names, max: 1 })[0]?.alias;
+    const testCell = h('td', {}, testBadge(latestTest(m)));
+    live.cells.set(m.id, { cell: testCell, m });
     const cb = h('input', { type: 'checkbox', checked: sel.has(m.id), 'aria-label': L('Selecionar {0}', m.alias), onchange: (e) => { if (e.target.checked) sel.add(m.id); else sel.delete(m.id); redrawDetail(); } });
     const text = `${m.alias} ${m.upstream}`.toLowerCase();
     const tr = h('tr', { 'data-q': text, class: q && !text.includes(q) ? 'hidden' : undefined },
       h('td', { class: 'chk' }, cb),
-      h('td', {}, h('div', { class: 'row' }, h('span', { class: 'ellipsis', 'data-tip': m.alias }, m.alias), routing.defaultAlias === m.alias && badge(L('Padrão'), 'accent'), compatBadge(m.compat), imagesBadge(m))),
-      h('td', { class: 'mono ellipsis muted', 'data-tip': m.upstream }, m.upstream), h('td', {}, testBadge(latestTest(m))),
+      h('td', {}, h('div', { class: 'row' }, h('span', { class: 'ellipsis', 'data-tip': m.alias }, m.alias), routing.defaultAlias === m.alias && badge(L('Padrão'), 'accent'), reachBadge(m.alias, fix), imagesBadge(m),
+        (m.priceIn !== null && m.priceIn !== undefined) || (m.priceOut !== null && m.priceOut !== undefined) ? badge(priceText(m), '', L('Entrada · saída, em dólar por 1M de tokens')) : null)),
+      h('td', { class: 'mono ellipsis muted', 'data-tip': m.upstream }, m.upstream), testCell,
       h('td', {}, toggle(m.enabled, async (v) => { await api('POST', `/api/providers/${p.id}/models`, { ...m, enabled: v }).catch(fail); route(); }, L('Ativar {0}', m.alias))),
       h('td', { class: 'actions' }, moreButton(() => [
-        { label: L('Teste completo'), icon: 'flask', disabled: busy, onClick: () => bulkTest(p, [m.id], true) },
+        { label: L('Teste rápido'), icon: 'lightning', disabled: !!state.live[m.id]?.running, onClick: () => bulkTest(p, [m.id], false) },
+        { label: L('Teste completo'), icon: 'flask', disabled: !!state.live[m.id]?.running, onClick: () => bulkTest(p, [m.id], true) },
         { label: L('Editar'), icon: 'pencil-simple', onClick: () => modelDialog(p, m, [], routing.defaultAlias === m.alias) },
+        fix && { label: L('Renomear para o Desktop'), icon: 'monitor', onClick: () => modelDialog(p, m, [], routing.defaultAlias === m.alias, { alias: fix }) },
         routing.defaultAlias !== m.alias && { label: L('Usar como padrão'), icon: 'star', onClick: () => setDefault(m) },
         'sep',
         { label: L('Remover'), icon: 'trash', danger: true, onClick: () => confirmDo(L('Remover {0}', m.alias), L('O alias deixa de existir neste provedor.'), L('Remover'), async () => { await api('DELETE', `/api/providers/${p.id}/models/${m.id}`); route(); }) },
@@ -1499,13 +1919,20 @@ function modelsPanel(p, routing) {
       for (const r of rows) r.tr.classList.toggle('hidden', !!t && !r.tr.dataset.q.includes(t));
       all.checked = visible().length > 0 && visible().every((id) => sel.has(id));
     } }));
-  const run = state.bulk?.pid === p.id ? state.bulk : null;
+  const run = state.runs.get(p.id) ?? null;
   const one = sel.size === 1 ? p.models.find((x) => sel.has(x.id)) : null;
-  const bar = run ? h('div', { class: 'bulkbar', role: 'status' }, icon('circle-notch', 'spinner'), h('span', {}, L('Testando {0} de {1}: {2} respondendo, {3} com falha', run.done, run.total, run.ok, run.fail)), h('span', { class: 'grow' }), button(L('Interromper'), () => { run.cancel = true; }, 'ghost sm'))
-    : sel.size > 0 && h('div', { class: 'bulkbar' }, h('span', {}, `${sel.size} selecionado(s)`), h('span', { class: 'grow' }),
+  if (run) live.label = h('span', {}, progressText(run));
+  const cliOnly = [...sel].filter((id) => { const m = p.models.find((x) => x.id === id); return m && !analyzeAlias(m.alias).desktop; });
+  // Testes de outros provedores continuam e podem ser interrompidos daqui.
+  const others = [...state.runs.values()].filter((r) => r !== run);
+  const progress = (run || others.length > 0) && h('div', { class: 'bulkbar', role: 'status' }, icon('circle-notch', 'spinner'),
+    run ? live.label : h('span', {}, L('Testando em {0}', others.map((r) => r.name).join(', '))), h('span', { class: 'grow' }),
+    button(L('Interromper'), () => { run?.stop(); if (!run) for (const r of others) r.stop(); }, 'ghost sm'));
+  const bar = sel.size > 0 && h('div', { class: 'bulkbar' }, h('span', {}, L('{0} selecionado(s)', sel.size)), h('span', { class: 'grow' }),
       one && routing.defaultAlias !== one.alias && button(L('Usar como padrão'), () => setDefault(one), 'ghost sm'),
       button(L('Teste rápido'), () => bulkTest(p, ids(), false), 'ghost sm', { 'data-tip': L('Uma chamada de texto por modelo') }),
-      button(L('Teste completo'), () => bulkTest(p, ids(), true), 'ghost sm', { 'data-tip': L('Texto, streaming e ferramentas: três chamadas por modelo') }),
+      button(L('Teste completo'), () => bulkTest(p, ids(), true), 'ghost sm', { 'data-tip': L('Texto, depois streaming e ferramentas juntos: três chamadas por modelo') }),
+      cliOnly.length > 0 && button(L('Ajustar para o Desktop'), () => fixForDesktop(p, cliOnly, routing), 'ghost sm', { 'data-tip': L('Renomeia os aliases Só CLI selecionados para nomes que aparecem também no Claude Desktop') }),
       button(L('Ativar'), () => bulkUpdate(p, ids(), { enabled: true }, true), 'ghost sm'),
       button(L('Desativar'), () => bulkUpdate(p, ids(), { enabled: false }, false), 'ghost sm'),
       button(L('Editar'), () => bulkEditDialog(p, ids()), 'ghost sm'),
@@ -1513,9 +1940,10 @@ function modelsPanel(p, routing) {
       button('', () => { sel.clear(); redrawDetail(); }, 'ghost sm icon-only', { icon: 'x', 'aria-label': L('Limpar seleção') }));
   return panel([L('Modelos'), L('{0} alias(es) apontando para modelos deste provedor', p.models.length)], [
     filter,
-    p.models.length > 1 && button(L('Testar todos'), () => bulkTest(p, p.models.filter((m) => m.enabled).map((m) => m.id), false), 'ghost sm', { disabled: busy, 'data-tip': L('Teste rápido de todos os modelos ativos') }),
+    p.models.length > 1 && button(L('Testar todos'), () => bulkTest(p, p.models.filter((m) => m.enabled).map((m) => m.id), false), 'ghost sm', { 'data-tip': L('Teste rápido de todos os modelos ativos. Para testar só alguns, marque-os na tabela.') }),
     button(L('Importar'), () => importDialog(p), 'sm', { icon: 'cloud-arrow-down' }),
     button('', () => modelDialog(p), 'sm icon-only', { icon: 'plus', 'aria-label': L('Adicionar modelo'), 'data-tip': L('Adicionar um modelo') })],
+  progress,
   bar,
   p.models.length ? h('div', { class: 'mtable' }, tableEl([{ t: all, cls: 'chk' }, L('Alias'), L('Modelo real'), L('Último teste'), L('Ativo'), { t: '', cls: 'actions' }], rows.map((r) => r.tr)))
     : h('div', { class: 'empty-state' }, L('Nenhum modelo ainda. Importe vários de uma vez da lista do provedor.'), button(L('Importar do provedor'), () => importDialog(p), 'primary', { icon: 'cloud-arrow-down' })));
@@ -1565,6 +1993,8 @@ async function routing(sheet) {
   sheet.replaceChildren(h('div', { class: 'page' },
     pageHead(L('Roteamento'), L('Escolha qual modelo responde. A troca vale na próxima requisição, sem tocar no Claude Code.')),
     !r.defaultAlias && aliases.length > 0 && notice(L('Pedidos "auto" e as tarefas de fundo do Claude Code (claude-haiku-*) recebem erro 404 até você escolher um modelo padrão.'), 'warn', L('Nenhum modelo padrão')),
+    r.defaultAlias && !rows.some(({ p, m }) => m.alias === r.defaultAlias && (p.authScheme === 'none' || p.keys.some((k) => k.enabled)))
+      && notice(L('O modelo padrão, {0}, não está em nenhum provedor ligado com chave. Pedidos "auto" falham até você ligar o provedor dele ou escolher outro modelo.', r.defaultAlias), 'warn', L('Modelo padrão fora do ar')),
     h('div', { class: 'cols' },
       h('div', { class: 'c7 stack' },
         panel([L('Comportamento'), L('Como o gateway escolhe o modelo de cada pedido')], null,
@@ -1581,6 +2011,32 @@ async function routing(sheet) {
 }
 
 // ---------- Claude Code ----------
+// Rótulos do Claude Desktop no idioma do próprio app, tirados dos arquivos de tradução dele (versão 5.1231).
+// O Desktop não tem chinês: lá ele aparece em inglês, e o passo a passo acompanha.
+const DESKTOP_UI = {
+  'pt-BR': ['Ajuda', 'Solução de problemas', 'Ativar modo de desenvolvedor', 'Desenvolvedor', 'Configurar inferência de terceiros', 'Conexão', 'Tipo de credencial', 'Chave de API estática', 'URL base do gateway', 'Chave de API do gateway', 'Esquema de autenticação do gateway', 'Descoberta de modelos', 'Aplicar alterações'],
+  en: ['Help', 'Troubleshooting', 'Enable Developer Mode', 'Developer', 'Configure Third-Party Inference', 'Connection', 'Credential type', 'Static API key', 'Gateway base URL', 'Gateway API key', 'Gateway auth scheme', 'Model discovery', 'Apply changes'],
+  es: ['Ayuda', 'Solución de problemas', 'Activar modo de desarrollador', 'Desarrollador', 'Configurar inferencia de terceros', 'Conexión', 'Tipo de credencial', 'Clave de API estática', 'URL base del gateway', 'Clave de API de Gateway', 'Esquema de autenticación del gateway', 'Detección de modelos', 'Aplicar cambios'],
+  fr: ['Aide', 'Dépannage', 'Activer le mode développeur', 'Développeur', 'Configurer l’inférence tierce', 'Connexion', 'Type d’identifiant', 'Clé API statique', 'URL de base de la passerelle', 'Clé API de passerelle', 'Schéma d’authentification de la passerelle', 'Découverte de modèles', 'Appliquer les modifications'],
+  de: ['Hilfe', 'Fehlerbehebung', 'Entwicklermodus aktivieren', 'Entwickler', 'Drittanbieter-Inferenz konfigurieren', 'Verbindung', 'Typ der Zugangsdaten', 'Statischer API-Schlüssel', 'Gateway-Basis-URL', 'Gateway-API-Schlüssel', 'Gateway-Authentifizierungsschema', 'Modellerkennung', 'Änderungen übernehmen'],
+  ja: ['ヘルプ', 'トラブルシューティング', '開発者モードを有効化', '開発者', 'サードパーティ推論を設定', '接続', '認証情報タイプ', '静的 API キー', 'ゲートウェイ ベース URL', 'ゲートウェイ API キー', 'ゲートウェイ認証スキーム', 'モデル検出', '変更を適用'],
+  ko: ['도움말', '문제 해결', '개발자 모드 활성화', '개발자', '타사 추론 설정', '연결', '자격 증명 유형', '정적 API 키', '게이트웨이 기본 URL', '게이트웨이 API 키', '게이트웨이 인증 방식', '모델 검색', '변경사항 적용'],
+};
+
+/** Passo a passo do Claude Desktop com os nomes que a pessoa vê na tela dele. */
+function desktopSteps() {
+  const [help, trouble, devMode, dev, thirdParty, conn, credType, staticKey, baseUrl, apiKey, scheme, discovery, apply] = DESKTOP_UI[currentLang()] ?? DESKTOP_UI.en;
+  const b = (...parts) => h('b', {}, parts.join(' › '));
+  return [
+    Ln('Menu {0}.', b(help, trouble, devMode)),
+    Ln('Menu {0}.', b(dev, thirdParty)),
+    Ln('Em {0}, escolha {1}.', b(conn), b('Gateway')),
+    Ln('Em {0}, deixe {1}.', b(credType), b(staticKey)),
+    Ln('Cole a URL em {0} e o token em {1}.', b(baseUrl), b(apiKey)),
+    Ln('Em {0}, escolha {1}.', b(scheme), b('bearer')),
+    Ln('Deixe ligada a opção {0}, clique em {1} e reinicie o app.', b(discovery), b(apply)),
+  ];
+}
 function copyLine(label, value, secret) {
   const code = h('code', {}, secret ? '•'.repeat(32) : value);
   let shown = !secret;
@@ -1606,18 +2062,41 @@ async function client(sheet) {
             : h('div', { class: 'empty-state' }, L('Nenhum alias publicado.')))),
       h('div', { class: 'c6 stack' },
         panel('Claude Desktop', null, h('div', { class: 'panel-body' }, h('ol', { class: 'steps-list' },
-          h('li', {}, h('span', {}, Ln('Menu {0}.', h('b', {}, 'Help › Troubleshooting › Enable Developer Mode')))),
-          h('li', {}, h('span', {}, Ln('Menu {0}.', h('b', {}, 'Developer › Configure Third-Party Inference')))),
-          h('li', {}, h('span', {}, Ln('Em {0}, escolha {1}.', h('b', {}, 'Inference provider'), h('b', {}, 'Gateway')))),
-          h('li', {}, h('span', {}, Ln('Cole a URL em {0} e o token em {1}. Esquema: bearer.', h('b', {}, 'Gateway base URL'), h('b', {}, 'Gateway API key')))),
-          h('li', {}, h('span', {}, Ln('Deixe {0} ligado, aplique e reinicie o app.', h('b', {}, 'Model discovery'))))))),
+          ...desktopSteps().map((s) => h('li', {}, h('span', {}, s)))))),
         panel([L('Terminal'), L('Mescle em ~/.claude/settings.json (faça uma cópia antes)')], h('button', { type: 'button', class: 'btn ghost sm icon-only', 'aria-label': L('Copiar'), 'data-tip': L('Copiar com o token'), onclick: async () => { await navigator.clipboard.writeText(cliJson); toast(L('Copiado')); } }, icon('copy')),
           h('div', { class: 'panel-body' }, h('pre', {}, cliJson.replace(c.token, L('<token do gateway>')))))))));
 }
 
 // ---------- configurações ----------
+/** Configurações → Atualizações: liga e desliga, mostra o estado e oferece verificar, instalar ou baixar. */
+function updatesSetting(s) {
+  const status = h('div', { class: 'small' });
+  const act = h('div', { class: 'row' });
+  const desc = () => (updates.info?.mode === 'auto' ? L('Baixa as versões novas do GitHub e instala quando o app reinicia.') : L('Avisa quando há uma versão nova no GitHub.'));
+  const descEl = h('div', { class: 'small' }, desc());
+  const paint = (u) => {
+    if (!descEl.isConnected && descEl.dataset.mounted) { updates.listeners.delete(paint); return; } // a tela saiu
+    descEl.textContent = desc();
+    status.textContent = updateText(u);
+    const a = updateAction(u);
+    act.replaceChildren(...[a ? button(a.label, a.run, 'primary sm', { icon: 'arrows-clockwise' })
+      : u?.enabled ? button(L('Verificar agora'), async (e) => { e.currentTarget.disabled = true; await loadUpdate({ force: true }); }, 'sm', { icon: 'arrows-clockwise' }) : null].filter(Boolean));
+  };
+  updates.listeners.add(paint);
+  paint(updates.info);
+  requestAnimationFrame(() => { descEl.dataset.mounted = '1'; });
+  loadUpdate().catch(() => {});
+  const sw = toggle(s.updateCheck !== false, async (v) => {
+    try { await api('PUT', '/api/settings', { updateCheck: v }); } catch (e) { fail(e); return; }
+    await loadUpdate({ force: v });
+  }, L('Atualizações automáticas'));
+  return h('div', { class: 'setting update-setting' },
+    h('div', { class: 'txt' }, h('div', {}, L('Atualizações')), descEl, status, act),
+    h('div', { class: 'ctl' }, sw));
+}
+
 async function settings(sheet) {
-  const { server: s, autoStartSupported, autoStartLabel, desktop, masterKeySource, logFile } = await api('GET', '/api/settings');
+  const [{ server: s, autoStartSupported, autoStartLabel, desktop, masterKeySource, logFile }, bud] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/budget')]);
   // A ação ao fechar é do app instalado (desktop/preload.cjs), não do gateway: aparece sempre que o painel
   // está dentro do app, mesmo quando ele abriu um Rotaz de terminal.
   const closeAction = desk?.getCloseAction ? await desk.getCloseAction().catch(() => null) : null;
@@ -1629,8 +2108,26 @@ async function settings(sheet) {
     logLevel: h('select', {}, ['error', 'warn', 'info', 'debug'].map((v) => h('option', { value: v }, v))),
   };
   f.host.value = s.host; f.logLevel.value = s.logLevel;
+  // Gastos e orçamento: limites na moeda escolhida; os preços dos modelos seguem em dólar e a cotação converte.
+  const money0 = (v) => h('input', { type: 'number', min: 0, step: 'any', value: v || '', placeholder: L('Sem limite') });
+  const g = {
+    currency: h('select', {}, [['USD', L('Dólar (US$)')], ['BRL', L('Real (R$)')], ['EUR', L('Euro (€)')]].map(([v, t]) => h('option', { value: v }, t))),
+    rate: h('input', { type: 'number', min: 0.0001, step: 'any', value: bud.rate }),
+    daily: money0(bud.daily), monthly: money0(bud.monthly),
+    warnAt: h('input', { type: 'number', min: 1, max: 99, value: bud.warnAt }),
+    action: h('select', {}, [['alert', L('Só avisar')], ['switch', L('Trocar para outro modelo')], ['block', L('Bloquear os pedidos')]].map(([v, t]) => h('option', { value: v }, t))),
+    fallback: aliasSelect(bud.fallbackAlias, bud.aliases, L('Escolha um modelo'), () => {}),
+  };
+  g.currency.value = bud.currency; g.action.value = bud.action;
+  const rateField = field(L('Cotação: 1 dólar vale'), g.rate, L('Atualize quando quiser; os preços dos modelos são em dólar.'));
+  const fallbackField = field(L('Modelo de reserva'), g.fallback, L('Use um modelo barato ou local.'), 'full');
+  const syncBudget = () => { rateField.hidden = g.currency.value === 'USD'; fallbackField.hidden = g.action.value !== 'switch'; };
+  g.currency.addEventListener('change', syncBudget); g.action.addEventListener('change', syncBudget);
+  syncBudget();
   const save = async () => {
     try {
+      await api('PUT', '/api/budget', { currency: g.currency.value, rate: Number(g.rate.value) || 1, daily: Number(g.daily.value) || 0, monthly: Number(g.monthly.value) || 0,
+        warnAt: Number(g.warnAt.value) || 80, action: g.action.value, fallbackAlias: g.fallback.value || null });
       const r = await api('PUT', '/api/settings', { host: f.host.value, port: Number(f.port.value), timeoutMs: Number(f.timeoutS.value) * 1000, maxBodyMB: Number(f.maxBodyMB.value), rateLimitPerMin: Number(f.rateLimitPerMin.value), maxConcurrent: Number(f.maxConcurrent.value), maxAttempts: Number(f.maxAttempts.value), logLevel: f.logLevel.value });
       if (r.rebind) { toast(L('Servidor mudando de porta…')); setTimeout(() => { location.href = `http://127.0.0.1:${r.port}/#/settings`; }, 1800); } else toast(L('Configurações salvas'));
     } catch (e) { fail(e); }
@@ -1656,7 +2153,12 @@ async function settings(sheet) {
         panel([L('Limites'), L('Protegem o gateway e os provedores contra excesso')], null, h('div', { class: 'panel-body form-grid' },
           field(L('Timeout do provedor (s)'), f.timeoutS, L('Sem resposta por esse tempo, a chamada falha.')), field(L('Tamanho máximo da requisição (MB)'), f.maxBodyMB),
           field(L('Requisições por minuto'), f.rateLimitPerMin, L('0 desliga o limite.')), field(L('Requisições simultâneas'), f.maxConcurrent),
-          field(L('Tentativas por requisição'), f.maxAttempts, L('Soma chaves e fallback.')), field(L('Nível de log'), f.logLevel, logFile)))),
+          field(L('Tentativas por requisição'), f.maxAttempts, L('Soma chaves e fallback.')), field(L('Nível de log'), f.logLevel, logFile))),
+        panel([L('Gastos e orçamento'), L('Conta só os modelos com preço cadastrado')], null, h('div', { class: 'panel-body form-grid' },
+          field(L('Moeda'), g.currency), rateField,
+          field(L('Limite por dia'), g.daily, L('Vazio ou 0: sem limite.')), field(L('Limite por mês'), g.monthly, L('Vazio ou 0: sem limite.')),
+          field(L('Avisar ao chegar em (%)'), g.warnAt), field(L('Ao atingir o limite'), g.action),
+          fallbackField))),
       h('div', { class: 'c5 stack' },
         panel([L('Aparência'), L('Vale para este painel em qualquer navegador')], null,
           setting(L('Tema'), L('Automático segue o sistema operacional.'), segmented([{ value: 'auto', label: L('Auto') }, { value: 'light', label: L('Claro') }, { value: 'dark', label: L('Escuro') }], state.ui?.theme ?? 'auto', (v) => saveUi({ theme: v }), { label: L('Tema') })),
@@ -1674,7 +2176,8 @@ async function settings(sheet) {
                 route();
               } catch (e) { fail(e); }
             }, { label: L('Ao fechar a janela') })),
-          setting(L('Senha do painel'), null, button(L('Trocar senha'), pw, 'sm', { icon: 'lock-simple' })))))));
+          setting(L('Senha do painel'), null, button(L('Trocar senha'), pw, 'sm', { icon: 'lock-simple' })),
+          updatesSetting(s))))));
 }
 
 // ---------- registros ----------
@@ -1688,7 +2191,12 @@ async function logs(sheet) {
     box.textContent = shown.join('\n') || L('Nada para mostrar.');
     if (stick) box.scrollTop = box.scrollHeight;
   };
-  const load = async () => { lines = (await api('GET', '/api/logs')).lines; paint(); };
+  const load = async () => {
+    const next = (await api('GET', '/api/logs')).lines;
+    if (next.length === lines.length && next.at(-1) === lines.at(-1)) return; // nada novo: não reescreve a caixa
+    lines = next;
+    paint();
+  };
   sheet.replaceChildren(h('div', { class: 'page' },
     pageHead(L('Registros'), L('Segredos são redigidos antes de gravar; o conteúdo das mensagens nunca é registrado.'), [
       segmented([{ value: 'all', label: L('Tudo') }, { value: 'warn', label: L('Avisos') }, { value: 'error', label: L('Erros') }], level, (v) => { level = v; paint(); }, { label: L('Filtro') }),
@@ -1696,13 +2204,11 @@ async function logs(sheet) {
     h('section', { class: 'panel' }, h('div', { class: 'panel-body' }, box))));
   await load();
   box.scrollTop = box.scrollHeight;
-  state.timer = setInterval(() => load().catch(() => {}), 5000);
+  poll(load, 5000);
 }
 
 const VIEWS = { overview, providers, routing, client, settings, logs };
 
-// Mesma lista do servidor (src/security.js), para o aviso imediato ao digitar o alias.
-window.DESKTOP_DENY = /ark-code|astron|command-r|deepseek|doubao|gemini|gemma|glm|gpt|grok|hermes|hy3|kimi|lfm|\bling\b|llama|longcat|mimo|minimax|mistral|mixtral|moonshot|nemotron|openai|phi-|qianfan|qwen|tc-code|\bunic\b|yi-|stepfun|step-3|seed-|bytedance|hunyuan|granite|amazon\.nova|nova-|devstral|ministral|ernie|codex|arcee|trinity|abab|phi\d|\bk2\.|\bm2\.|jamba|arctic|solar|mercury|zamba|kat-coder|\bds-|dpsk/;
 
 // ---------- abertura e boas-vindas (app instalado, primeira vez) ----------
 /**
@@ -1888,6 +2394,7 @@ async function boot() {
   const chosen = pendingLang.get();
   if (chosen) { await api('PUT', '/api/ui', { lang: chosen }).catch(() => {}); pendingLang.clear(); s.ui = { ...s.ui, lang: chosen }; applyUi(s.ui); }
   shell(s);
+  loadUpdate().catch(() => {});
   route();
 }
 
