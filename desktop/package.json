@@ -1,18 +1,20 @@
 {
   "name": "rotaz-desktop",
   "productName": "Rotaz",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Rotaz: qualquer modelo no seu Claude Code.",
-  "author": "Rotaz",
+  "author": "Alisson Paganini",
+  "homepage": "https://github.com/alissonpaganini/rotaz",
   "license": "MIT",
   "private": true,
   "type": "module",
   "main": "main.js",
+  "appUserModelId": "dev.rotaz.app",
   "scripts": {
     "start": "electron .",
     "dist:win": "electron-builder --win --x64 --publish never",
     "dist:mac": "electron-builder --mac --publish never",
-    "dist:linux": "electron-builder --linux AppImage --x64 --publish never"
+    "dist:linux": "electron-builder --linux AppImage deb --x64 --publish never"
   },
   "devDependencies": {
     "electron": "45.0.0",
@@ -24,7 +26,7 @@
   "build": {
     "appId": "dev.rotaz.app",
     "productName": "Rotaz",
-    "copyright": "Rotaz, licença MIT",
+    "copyright": "© 2026 Alisson Paganini · MIT",
     "asar": false,
     "directories": { "output": "dist", "buildResources": "build" },
     "publish": { "provider": "github", "owner": "alissonpaganini", "repo": "rotaz", "releaseType": "release" },
@@ -43,9 +45,19 @@
       "artifactName": "Rotaz-${version}-Windows-x64-Setup.${ext}"
     },
     "nsis": {
-      "oneClick": true,
+      "oneClick": false,
       "perMachine": false,
-      "allowElevation": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "license": "../LICENSE",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "multiLanguageInstaller": true,
+      "installerLanguages": ["pt_BR", "en_US", "es_ES", "fr_FR", "de_DE", "ja_JP", "ko_KR", "zh_CN"],
+      "displayLanguageSelector": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Rotaz",
@@ -58,7 +70,16 @@
       "hardenedRuntime": true,
       "artifactName": "Rotaz-${version}-macOS-universal.${ext}"
     },
-    "dmg": { "title": "Rotaz" },
-    "linux": { "target": ["AppImage"], "category": "Development", "icon": "build/icon.png", "synopsis": "Qualquer modelo no seu Claude Code", "artifactName": "Rotaz-${version}-Linux-${arch}.${ext}" }
+    "dmg": {
+      "title": "Rotaz",
+      "background": "build/background.png",
+      "iconSize": 96,
+      "window": { "width": 540, "height": 380 },
+      "contents": [
+        { "x": 140, "y": 200 },
+        { "x": 400, "y": 200, "type": "link", "path": "/Applications" }
+      ]
+    },
+    "linux": { "target": ["AppImage", "deb"], "executableName": "rotaz", "maintainer": "Alisson Paganini <https://github.com/alissonpaganini/rotaz>", "category": "Development", "icon": "build/icon.png", "synopsis": "Qualquer modelo no seu Claude Code", "artifactName": "Rotaz-${version}-Linux-${arch}.${ext}" }
   }
 }

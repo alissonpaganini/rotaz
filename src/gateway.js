@@ -1,15 +1,19 @@
 // Endpoints públicos do gateway: /v1/messages, /v1/chat/completions, /v1/models, count_tokens.
 import { once } from 'node:events';
-import { shortId, sha256 } from './crypto.js';
-import { timingSafeEqual } from 'node:crypto';
-import { buildRoute, KeyPool, providerGate } from './routing.js';
-import { prepare, convertResponse, makeStream, usageTokens, adaptPayload, joinUrl, authHeaders, imageLimitFromError, countImages, withImageLimit } from './pipeline.js';
+import { shortId } from './crypto.js';
+import { buildRoute, KeyPool, providerGate, abortableSleep } from './routing.js';
+import { prepare, convertBody, StreamRelay, usageTokens, joinUrl, authHeaders } from './pipeline.js';
 import { send, readText, UpstreamError } from './upstream.js';
 import { SSEParser, safeParse, parseUpstreamError, toAnthropicError, toOpenAIError, estimateTokens } from './translate/common.js';
-import { TranslationError } from './translate/openai-to-anthropic.js';
+import { TranslationError } from './translate/common.js';
 import { redact } from './security.js';
 import { LocalError, K, tr, resolveLang } from './i18n.js';
 import { costOf } from './budget.js';
+import { accountOf } from './providers/index.js';
+import { sendAdapting } from './exchange.js';
+
+/** Modelo com contexto de 1 milhão de tokens ou mais: vai para o Claude Code com o sufixo [1m]. */
+export const oneMillion = (m) => Number.isInteger(m?.contextWindow) && m.contextWindow >= 1000000;
 
 export class BodyError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
@@ -40,6 +44,8 @@ function validate(proto, b) {
 }
 
 const MAX_429_WAIT = 30000;
+/** Conta ou chave recusada (acesso, crédito): fica fora do rodízio por 5 minutos. */
+const ACCOUNT_PENALTY_MS = 300000;
 
 /** Tempo pedido pelo provedor: header Retry-After ou frases como "Retry in 12s" / "try again in 2.5 seconds". */
 export function retryAfterMs(header, message) {
@@ -76,12 +82,12 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
   function authorized(req) {
     const h = req.headers;
     const presented = h['x-api-key'] || /^Bearer\s+(.+)$/i.exec(h.authorization ?? '')?.[1];
-    return !!presented && timingSafeEqual(sha256(presented), store.tokenHash);
+    return store.checkGatewayToken(presented);
   }
 
   /** Relay de streaming: chunk a chunk, com backpressure, ping e detecção de corte. */
   async function relay(res, up, ctx, abortCtl) {
-    const tr = makeStream(ctx);
+    const st = new StreamRelay(ctx);
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
     res.flushHeaders();
     res.socket?.setNoDelay(true);
@@ -93,43 +99,29 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
       if (!res.write(s)) await Promise.race([once(res, 'drain'), once(res, 'close')]);
     };
     const timeoutMs = store.server.timeoutMs;
-    let idleTimer = setTimeout(() => { idle = true; up.abort(); }, timeoutMs);
-    const pinger = setInterval(() => { if (Date.now() - last > 15000 && !res.destroyed) { res.write(tr.ping()); last = Date.now(); } }, 5000);
+    const idleTimer = setTimeout(() => { idle = true; up.abort(); }, timeoutMs);
+    const pinger = setInterval(() => { if (Date.now() - last > 15000 && !res.destroyed) { res.write(st.ping()); last = Date.now(); } }, 5000);
     const parser = new SSEParser();
-    let complete = false;
-    let sawFinish = false;
     const isSSE = /event-stream/.test(up.headers['content-type'] ?? '');
-
-    const handle = async (evt) => {
-      if (evt.data === '[DONE]') { complete = true; if (tr.passthrough && ctx.clientProto === 'openai') await write('data: [DONE]\n\n'); return; }
-      const obj = safeParse(evt.data);
-      if (!obj) return;
-      if (tr.passthrough) {
-        tr.observe(obj);
-        await write(evt.event ? `event: ${evt.event}\ndata: ${evt.data}\n\n` : `data: ${evt.data}\n\n`);
-        return;
-      }
-      if (obj.choices?.[0]?.finish_reason) sawFinish = true;
-      await write(tr.push(obj));
-    };
 
     try {
       if (!isSSE) {
         // Alguns provedores ignoram stream:true e devolvem JSON; vira um único delta.
-        const j = safeParse(await readText(up.stream));
+        const j = safeParse(await readText(up.stream, undefined, timeoutMs));
         if (!j) throw new UpstreamError('protocol', 'Resposta inválida do provedor.');
-        if (ctx.upstreamProto !== 'openai' || tr.passthrough) throw new UpstreamError('protocol', 'O provedor não respondeu em streaming.');
-        const m = j.choices?.[0]?.message ?? {};
-        await write(tr.push({ choices: [{ delta: { ...m, tool_calls: m.tool_calls?.map((c, index) => ({ index, ...c })) }, finish_reason: j.choices?.[0]?.finish_reason ?? 'stop' }], usage: j.usage }));
-        complete = true;
+        if (ctx.upstreamProto !== 'openai' || st.passthrough) throw new UpstreamError('protocol', 'O provedor não respondeu em streaming.');
+        await write(st.single(j));
       } else {
         for await (const chunk of up.stream) {
-          clearTimeout(idleTimer);
-          idleTimer = setTimeout(() => { idle = true; up.abort(); }, timeoutMs);
-          for (const evt of parser.feed(chunk)) await handle(evt);
+          idleTimer.refresh();
+          let out = '';
+          for (const evt of parser.feed(chunk)) out += st.feed(evt);
+          await write(out);
           if (res.destroyed) break;
         }
-        for (const evt of parser.flush()) await handle(evt);
+        let out = '';
+        for (const evt of parser.flush()) out += st.feed(evt);
+        await write(out);
       }
     } catch (e) {
       log.debug(`stream interrompido: ${e.message}`);
@@ -137,18 +129,23 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
       clearTimeout(idleTimer);
       clearInterval(pinger);
     }
-    if (ctx.upstreamProto === 'anthropic') complete = tr.stopped === true;
-    else complete = complete || sawFinish;
-    if (idle) complete = false;
+    const complete = !idle && st.isComplete();
     if (!res.destroyed) {
-      await write(tr.end(complete));
-      if (tr.passthrough && !complete) {
+      await write(st.end(complete));
+      if (st.passthrough && !complete) {
         const msg = say(K('A conexão com o provedor terminou antes do fim da resposta.'));
-        await write(ctx.clientProto === 'anthropic' ? `event: error\ndata: ${JSON.stringify(toAnthropicError(502, msg))}\n\n` : `data: ${JSON.stringify(toOpenAIError(502, msg))}\n\ndata: [DONE]\n\n`);
+        await write(ctx.clientProto === 'anthropic' ? `event: error
+data: ${JSON.stringify(toAnthropicError(502, msg))}
+
+` : `data: ${JSON.stringify(toOpenAIError(502, msg))}
+
+data: [DONE]
+
+`);
       }
       res.end();
     }
-    return { usage: tr.finalUsage, complete, clientGone: abortCtl.signal.aborted, upstreamError: tr.upstreamError };
+    return { usage: st.finalUsage, complete, clientGone: abortCtl.signal.aborted, upstreamError: st.upstreamError };
   }
 
   async function chat(req, res, proto, id) {
@@ -201,6 +198,10 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
     if (round === 1) {
       if (lastErr?.status !== 429 || !(lastErr.waitMs <= MAX_429_WAIT) || abortCtl.signal.aborted) break;
       log.info(`${id} ${lastErr.target.provider.name} pediu para aguardar ${Math.ceil(lastErr.waitMs / 1000)}s; tentando de novo`);
+      // Com uma chave só, a fila do provedor já segura a vez; com várias, todas estão em quarentena e
+      // repetir na hora só gastaria as tentativas com outro 429. Espera o tempo pedido antes.
+      try { await abortableSleep(lastErr.waitMs, abortCtl.signal); }
+      catch { finish({ status: 499, error: 'Cliente desconectou.', providerId: lastErr.target.provider.id, providerName: lastErr.target.provider.name, upstream: lastErr.target.model.upstream }); return; }
       attempts = 0;
     }
     for (const target of route.targets) {
@@ -209,38 +210,37 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
       for (const k of pool.order(p)) {
         if (attempts >= srv.maxAttempts) break;
         attempts++;
+        const account = accountOf(p);
         let prep;
-        const maxImages = imageLimit(m);
+        let cred;
         try {
-          prep = prepare(proto, body, target, { key: k ? store.keyValue(p, k) : null, extraHeaders, clientHeaders: req.headers, alias: route.alias, maxImages });
+          // Conta renova o acesso na hora e pode exigir uma chamada antes do pedido; as duas coisas podem falhar
+          // (acesso revogado, rede, conta sem token): a conta sai da vez e o pedido segue para a próxima.
+          cred = await account.credential(store, p, k);
+          prep = prepare(proto, body, target, { key: cred, extraHeaders, clientHeaders: req.headers, alias: route.alias, maxImages: imageLimit(m) });
+          prep = await account.before(p, m.upstream, cred, prep);
         } catch (e) {
           if (e instanceof TranslationError) { finish({ status: 400, error: e.message }); return sendError(res, proto, 400, e.message); }
-          throw e;
+          const said = new LocalError('{0}: {1}', p.name, e);
+          metrics.providerFailure(p.id, e.status ?? 0, said.message);
+          log.warn(`${id} ${p.name}: ${e.message}`);
+          // Renovar o acesso falhou: a conta sai da vez. Já a chamada antes do pedido falha por fora (rede, sessão).
+          if (cred === undefined && e.status !== 429) pool.penalize(k?.id, ACCOUNT_PENALTY_MS);
+          lastErr = { status: e.status === 429 ? 429 : 502, message: said.message, said, target };
+          continue;
         }
 
         let up;
-        let payload = prep.payload;
         try {
-          for (let adapt = 0; ; adapt++) {
-            await providerGate.acquire(p, { signal: abortCtl.signal, maxWaitMs: srv.timeoutMs });
-            up = await send({ url: prep.url, headers: prep.headers, body: payload, timeoutMs: srv.timeoutMs, allowPrivate: p.allowPrivateNetwork, signal: abortCtl.signal });
-            if (up.status !== 400 && up.status !== 422 && up.status !== 413) break;
-            const text = await readText(up.stream, 1024 * 1024);
-            const err = parseUpstreamError(up.status, text);
-            if (adapt >= 3) { up.errorBody = err; break; }
-            // Modelo que não aceita imagens (ou aceita poucas): aprende o limite e reenvia sem as excedentes.
-            const lim = imageLimitFromError(err.message);
-            if (lim !== null && countImages(payload, p.type) > lim) {
+          up = await sendAdapting({
+            provider: p, prep, signal: abortCtl.signal, timeoutMs: () => srv.timeoutMs,
+            // Modelo que não aceita imagens (ou aceita poucas): aprende o limite e os próximos pedidos já vão sem as excedentes.
+            onImageLimit: (lim) => {
               learnedImages.set(m.id, Math.min(lim, learnedImages.get(m.id) ?? Infinity));
               log.warn(`${id} ${p.name}/${m.upstream} ${lim === 0 ? 'não aceita imagens' : `aceita no máximo ${lim} imagem(ns)`}; as excedentes serão omitidas daqui em diante`);
-              payload = withImageLimit(payload, p.type, lim);
-              continue;
-            }
-            const next = adaptPayload(payload, err.message, p.type);
-            if (!next) { up.errorBody = err; break; }
-            log.debug(`${id} ajustando parâmetros para ${p.name}: ${err.message}`);
-            payload = next;
-          }
+            },
+            onAdapt: (message) => log.debug(`${id} ajustando parâmetros para ${p.name}: ${message}`),
+          });
         } catch (e) {
           if (e.kind === 'aborted') { finish({ status: 499, error: 'Cliente desconectou.', providerId: p.id, providerName: p.name, upstream: m.upstream }); return; }
           if (e.kind === 'queue') { lastErr = { status: 429, message: e.message, said: e, target }; break; }
@@ -271,9 +271,7 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
           let out;
           try {
             const text = await readText(up.stream, 64 * 1024 * 1024, srv.timeoutMs);
-            const json = safeParse(text);
-            if (!json) throw new Error(K('corpo não é JSON'));
-            out = convertResponse(json, prep.ctx);
+            out = convertBody(text, prep.ctx); // JSON, ou SSE do Antigravity juntado numa resposta
           } catch (e) {
             const said = new LocalError('{0}: resposta fora do protocolo esperado ({1}).', p.name, e);
             metrics.providerFailure(p.id, 502, said.message);
@@ -289,9 +287,14 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
         const err = up.errorBody ?? parseUpstreamError(up.status, await readText(up.stream, 1024 * 1024).catch(() => ''));
         metrics.providerFailure(p.id, up.status, err.message);
         log.warn(`${id} ${p.name} respondeu ${up.status}: ${err.message}`);
-        lastErr = { status: up.status, message: err.message, target, retryAfter: up.headers['retry-after'] };
+        const hint = account.explain(up.status, err.message);
+        lastErr = { status: up.status, message: hint?.message.message ?? err.message, said: hint?.message, target, retryAfter: up.headers['retry-after'] };
 
-        if (up.status === 401 || up.status === 403) { pool.penalize(k?.id, 300000); continue; } // próxima chave
+        if (up.status === 401 || up.status === 403) {
+          account.forget(store, p, k);
+          pool.penalize(k?.id, ACCOUNT_PENALTY_MS);
+          continue;
+        }
         if (up.status === 429) {
           const waitMs = retryAfterMs(up.headers['retry-after'], err.message);
           lastErr.waitMs = waitMs;
@@ -300,8 +303,8 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
           if (p.keys.filter((x) => x.enabled).length <= 1) providerGate.pause(p.id, waitMs);
           continue;
         }
-        if (up.status === 402) { pool.penalize(k?.id, 300000); continue; }
-        if (up.status === 404 || up.status >= 500) break;  // próximo alvo
+        if (up.status === 402) { pool.penalize(k?.id, ACCOUNT_PENALTY_MS); continue; }
+        if (up.status === 404 || up.status >= 500) break;
         // Erro da própria requisição: outro provedor recusaria igual, e o cliente precisa ver a mensagem.
         finish({ status: up.status, error: err.message, providerId: p.id, providerName: p.name, upstream: m.upstream });
         return sendError(res, proto, up.status, err.message, { 'x-should-retry': 'false' });
@@ -332,12 +335,23 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
         if (m.enabled && !seen.has(m.alias)) seen.set(m.alias, { p, m });
       }
     }
-    const rows = [...seen.values()].map(({ p, m }) => ({
-      type: 'model', id: m.alias, display_name: m.displayName, created_at: '2025-01-01T00:00:00Z',
-      description: `${p.name} · ${m.upstream}`.slice(0, 100),
-      object: 'model', created: 1735689600, owned_by: p.name,
-    }));
-    rows.sort((a, b) => (b.id === r.defaultAlias) - (a.id === r.defaultAlias));
+    // Janela de contexto, para os dois clientes (conferido no app Claude 5.11492 e no Claude Code 2.1.321):
+    // - app Claude: lê max_input_tokens / supports_1m / prefer_1m da linha do modelo e passa a usar 1M;
+    // - Claude Code de terminal: só lê id e nome, e usa 1M quando o id termina em [1m] (senão, 200 mil).
+    // Por isso um modelo de 1M sai duas vezes: o nome normal com os campos e o nome com [1m]. O app Claude junta as
+    // duas linhas num modelo só. O pedido chega sem o sufixo (ou com ele, e o roteamento o descarta).
+    const rows = [];
+    for (const { p, m } of seen.values()) {
+      const base = { type: 'model', id: m.alias, display_name: m.displayName, created_at: '2025-01-01T00:00:00Z',
+        description: `${p.name} · ${m.upstream}`.slice(0, 100), object: 'model', created: 1735689600, owned_by: p.name };
+      if (Number.isInteger(m.contextWindow)) base.max_input_tokens = m.contextWindow;
+      if (Number.isInteger(m.maxOutputTokens)) base.max_output_tokens = m.maxOutputTokens;
+      if (oneMillion(m)) Object.assign(base, { supports_1m: true, prefer_1m: true });
+      rows.push(base);
+      if (oneMillion(m)) rows.push({ ...base, id: `${m.alias}[1m]`, display_name: `${m.displayName} (1M)`, supports_1m: undefined, prefer_1m: undefined });
+    }
+    const isDefault = (row) => row.id.replace(/\[1m\]$/, '') === r.defaultAlias;
+    rows.sort((a, b) => isDefault(b) - isDefault(a));
     return rows;
   }
 
@@ -391,7 +405,8 @@ export function createGateway({ store, metrics, log, limiter, budget }) {
     }
     if (req.method === 'GET' && /\/models\/.+$/.test(path)) {
       const wanted = decodeURIComponent(path.split('/').pop());
-      const row = listModels().find((m) => m.id === wanted);
+      const bare = (id) => id.replace(/\[1m\]$/i, '');
+      const row = listModels().find((m) => m.id === wanted) ?? listModels().find((m) => bare(m.id) === bare(wanted));
       if (!row) { sendError(res, proto, 404, 'Modelo não encontrado.'); return true; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(row));

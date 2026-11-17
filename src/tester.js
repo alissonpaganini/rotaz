@@ -1,12 +1,15 @@
 // Teste de provedor: requisição real ao modelo configurado, pelo mesmo pipeline do tráfego do Claude Code.
-import { prepare, convertResponse, makeStream, adaptPayload, joinUrl, authHeaders } from './pipeline.js';
+import { prepare, convertBody, StreamRelay, joinUrl, authHeaders } from './pipeline.js';
+import { fetchModelCatalog } from './providers/antigravity.js';
+import { modelsRequest } from './providers/oauth/engine.js';
+import { accountOf } from './providers/index.js';
+import { sendAdapting } from './exchange.js';
 import { send, readText } from './upstream.js';
-import { providerGate } from './routing.js';
 import { SSEParser, safeParse, parseUpstreamError } from './translate/common.js';
 import { K, M, LocalError } from './i18n.js';
 
 const LABELS = {
-  functional: K('Funcional'), auth_failed: K('Falha de autenticação'), invalid_endpoint: K('Endpoint inválido'), model_not_found: K('Modelo inexistente'),
+  functional: K('Funcional'), auth_failed: K('Falha de autenticação'), verify_account: K('Conta a verificar'), invalid_endpoint: K('Endpoint inválido'), model_not_found: K('Modelo inexistente'),
   timeout: K('Timeout'), protocol_error: K('Erro de protocolo'), connection_failed: K('Falha de conexão'), rate_limited: K('Limite ou saldo do provedor'),
   provider_error: K('Erro do provedor'), blocked: K('Bloqueado pela proteção SSRF'), no_key: K('Sem chave cadastrada'), no_model: K('Sem modelo configurado'),
   aborted: K('Interrompido'),
@@ -44,30 +47,19 @@ class Clock {
 const readBody = async (up, clock, limit = 1024 * 1024) => readText(up.stream, limit, clock.left());
 
 async function call(target, prep, clock) {
-  let payload = prep.payload;
-  for (let i = 0; ; i++) {
-    // o teste em massa também respeita o limite por minuto, mas nunca espera além do prazo do teste
-    await providerGate.acquire(target.provider, { maxWaitMs: clock.left(), signal: clock.signal });
-    const up = await send({ url: prep.url, headers: prep.headers, body: payload, timeoutMs: clock.left(), allowPrivate: target.provider.allowPrivateNetwork, signal: clock.signal });
-    if (up.status === 400 || up.status === 422) {
-      const err = parseUpstreamError(up.status, await readBody(up, clock));
-      const next = i < 3 ? adaptPayload(payload, err.message, target.provider.type) : null;
-      if (next) { payload = next; continue; }
-      return { ...up, err };
-    }
-    return up;
-  }
+  const p = target.provider;
+  const ready = await accountOf(p).before(p, target.model.upstream, target.cred, prep);
+  return sendAdapting({ provider: p, prep: ready, signal: clock.signal, timeoutMs: () => clock.left() });
 }
 
 /** Consome o stream pelo tradutor real e confere a sequência de eventos Anthropic. */
 async function streamCheck(target, opts, clock) {
   const prep = prepare('anthropic', { ...PROMPT, stream: true }, target, opts);
   const up = await call(target, prep, clock);
-  if (up.status !== 200) { if (up.stream && !up.err) up.abort(); return { ok: false, detail: `HTTP ${up.status}` }; }
-  const tr = makeStream(prep.ctx);
+  if (up.status !== 200) { if (up.stream && !up.errorBody) up.abort(); return { ok: false, detail: `HTTP ${up.status}` }; }
+  const st = new StreamRelay(prep.ctx);
   const parser = new SSEParser();
   let out = '';
-  let complete = false;
   // Sem prazo, um provedor que segura a conexão aberta travava o teste para sempre.
   const timer = setTimeout(() => up.stream.destroy(Object.assign(new LocalError('O streaming não terminou no prazo.'), { kind: 'timeout' })), clock.left());
   const onAbort = () => up.abort();
@@ -75,13 +67,8 @@ async function streamCheck(target, opts, clock) {
   try {
     read: for await (const c of up.stream) {
       for (const e of parser.feed(c)) {
-        if (e.data === '[DONE]') { complete = true; break read; }
-        const o = safeParse(e.data);
-        if (!o) continue;
-        if (tr.passthrough) { tr.observe(o); out += `event: ${e.event}\n`; if (e.event === 'message_stop') break read; } else {
-          if (o.choices?.[0]?.finish_reason) complete = true;
-          out += tr.push(o);
-        }
+        out += st.feed(e);
+        if (st.isComplete()) break read;
       }
     }
   } finally {
@@ -89,7 +76,7 @@ async function streamCheck(target, opts, clock) {
     clock.signal?.removeEventListener('abort', onAbort);
     up.abort(); // terminou: não espera o provedor fechar a conexão
   }
-  if (tr.passthrough) complete = tr.stopped; else out += tr.end(complete);
+  out += st.end(st.isComplete());
   const seq = [...out.matchAll(/^event: (\w+)/gm)].map((m) => m[1]).filter((x) => x !== 'ping');
   const ok = seq[0] === 'message_start' && seq.includes('content_block_delta') && seq.at(-1) === 'message_stop';
   return { ok, detail: ok ? M('{0} eventos, sequência válida', seq.length) : M('sequência inválida: {0}', seq.slice(0, 6).join(', ') || K('vazia')) };
@@ -99,17 +86,19 @@ async function toolCheck(target, opts, clock) {
   const body = { messages: [{ role: 'user', content: 'Check the status of the service named "api" using the tool.' }], max_tokens: 512, tools: [TOOL], tool_choice: { type: 'any' } };
   const prep = prepare('anthropic', body, target, opts);
   const up = await call(target, prep, clock);
-  if (up.status !== 200) { if (up.stream && !up.err) up.abort(); return { ok: false, detail: up.err?.message?.slice(0, 160) ?? `HTTP ${up.status}` }; }
-  const r = convertResponse(safeParse(await readBody(up, clock, 8 * 1024 * 1024)) ?? {}, prep.ctx);
+  if (up.status !== 200) { if (up.stream && !up.errorBody) up.abort(); return { ok: false, detail: up.errorBody?.message?.slice(0, 160) ?? `HTTP ${up.status}` }; }
+  const r = convertBody(await readBody(up, clock, 8 * 1024 * 1024), prep.ctx);
   const use = r.content.find((b) => b.type === 'tool_use');
   return use?.name === TOOL.name ? { ok: true, detail: M('chamou {0}', use.name) } : { ok: false, detail: K('modelo não chamou a ferramenta') };
 }
 
 /** `quick`: uma única chamada de texto, para testar muitos modelos gastando pouco. */
-export async function testProvider(store, providerId, { modelId, keyId, timeoutMs = 30000, quick = false, signal } = {}) {
+export async function testProvider(store, providerId, { modelId, upstream, keyId, timeoutMs = 30000, quick = false, signal } = {}) {
   const p = store.provider(providerId);
   if (!p) throw new Error(K('Provedor não encontrado.'));
-  const m = modelId ? p.models.find((x) => x.id === modelId) : p.models.find((x) => x.enabled) ?? p.models[0];
+  // upstream: um modelo da lista do provedor que ainda não foi adicionado (importação: testar antes de escolher)
+  const m = typeof upstream === 'string' && upstream ? { id: null, alias: 'claude-teste', upstream, enabled: true }
+    : modelId ? p.models.find((x) => x.id === modelId) : p.models.find((x) => x.enabled) ?? p.models[0];
   const k = keyId ? p.keys.find((x) => x.id === keyId) : p.keys.find((x) => x.enabled);
   const steps = [];
   const step = (name, ok, detail = '') => steps.push({ name, ok, detail });
@@ -117,10 +106,14 @@ export async function testProvider(store, providerId, { modelId, keyId, timeoutM
     status, label: LABELS[status], message, provider: p.name, modelId: m?.id ?? null, quick, alias: m?.alias ?? null, upstream: m?.upstream ?? null, keyLabel: k?.label ?? null, steps, at: Date.now(), ...extra,
   });
   if (!m) return result('no_model', K('Cadastre ao menos um modelo neste provedor.'));
-  if (!k && p.authScheme !== 'none') return result('no_key', K('Cadastre ao menos uma chave de API neste provedor.'));
+  const account = accountOf(p);
+  if (!k && p.authScheme !== 'none') return result('no_key', account.missing);
 
-  const target = { provider: p, model: m };
-  const opts = { key: k ? store.keyValue(p, k) : null, extraHeaders: store.headersOf(p), alias: m.alias };
+  let key;
+  try { key = await account.credential(store, p, k); }
+  catch (e) { step(K('Autenticação'), false, e); return result('auth_failed', e); }
+  const target = { provider: p, model: m, cred: key };
+  const opts = { key, extraHeaders: store.headersOf(p), alias: m.alias };
   const prep = prepare('anthropic', PROMPT, target, opts);
   // Prazo total: o rápido tem uma chamada; o completo, a de texto e depois streaming e ferramentas juntas.
   const clock = new Clock(quick ? timeoutMs : timeoutMs * 2, signal);
@@ -136,11 +129,13 @@ export async function testProvider(store, providerId, { modelId, keyId, timeoutM
   step(K('Conectividade'), true, new URL(prep.url).host);
 
   if (up.status < 200 || up.status >= 300) {
-    const err = up.err ?? parseUpstreamError(up.status, await readBody(up, clock).catch(() => ''));
-    const status = classifyHttp(up.status, err.message);
-    step(K('Autenticação'), status !== 'auth_failed', status === 'auth_failed' ? K('credencial recusada') : K('aceita'));
+    const err = up.errorBody ?? parseUpstreamError(up.status, await readBody(up, clock).catch(() => ''));
+    const hint = account.explain(up.status, err.message);
+    const status = hint?.status ?? classifyHttp(up.status, err.message);
+    const refused = status === 'auth_failed' || status === 'verify_account';
+    step(K('Autenticação'), !refused, refused ? K('credencial recusada') : K('aceita'));
     step(K('Resposta HTTP'), false, `HTTP ${up.status}`);
-    return result(status, err.message, { httpStatus: up.status, latencyMs });
+    return result(status, hint?.message ?? err.message, { httpStatus: up.status, latencyMs });
   }
   step(K('Autenticação'), true, p.authScheme === 'none' ? K('sem autenticação') : M('chave {0}', k.hint));
   step(K('Resposta HTTP'), true, `HTTP ${up.status}`);
@@ -148,13 +143,13 @@ export async function testProvider(store, providerId, { modelId, keyId, timeoutM
   let text;
   try { text = await readBody(up, clock, 8 * 1024 * 1024); }
   catch (e) { step(K('Estrutura da resposta'), false, e); return result(e.kind === 'aborted' ? 'aborted' : 'timeout', e, { latencyMs }); }
-  const json = safeParse(text);
-  if (!json) {
+  // Provedores que só respondem em streaming mandam SSE mesmo sem stream: convertBody junta, igual ao gateway.
+  if (!/^\s*(data|event|:)/.test(text) && !safeParse(text)) {
     step(K('Estrutura da resposta'), false, K('corpo não é JSON'));
     return result(/<html/i.test(text) ? 'invalid_endpoint' : 'protocol_error', K('O provedor não devolveu JSON. Confira a URL base.'), { latencyMs });
   }
   let msg;
-  try { msg = convertResponse(json, prep.ctx); }
+  try { msg = convertBody(text, prep.ctx); }
   catch (e) { step(K('Estrutura da resposta'), false, e); return result('protocol_error', M('Resposta fora do protocolo: {0}', e), { latencyMs }); }
   step(K('Estrutura da resposta'), true, p.type === 'openai' ? K('chat.completion válido') : K('message válido'));
 
@@ -195,24 +190,75 @@ export async function discoverCatalog(store, providerId) {
   const p = store.provider(providerId);
   if (!p) throw new Error(K('Provedor não encontrado.'));
   const k = p.keys.find((x) => x.enabled);
-  if (!k && p.authScheme !== 'none') throw new Error(K('Cadastre uma chave antes de buscar modelos.'));
-  const url = p.type === 'anthropic' ? joinUrl(p.baseUrl, 'anthropic').replace(/\/messages$/, '/models?limit=1000') : joinUrl(p.baseUrl, 'openai').replace(/\/chat\/completions$/, '/models');
-  const headers = { ...authHeaders(p, k ? store.keyValue(p, k) : null), ...store.headersOf(p), ...(p.type === 'anthropic' && { 'anthropic-version': '2023-06-01' }) };
+  if (!k && p.authScheme !== 'none') throw new Error(accountOf(p).missingForModels);
+  // Antigravity: o catálogo vem do fetchAvailableModels da conta, não de um endpoint /models.
+  if (p.type === 'antigravity') {
+    const cred = await accountOf(p).credential(store, p, k);
+    const catalog = await fetchModelCatalog(cred);
+    const models = Object.keys(catalog).sort();
+    if (!models.length) throw new Error(K('A conta não devolveu a lista de modelos.'));
+    // Nome, contexto e limite de saída de cada modelo: o painel preenche o cadastro e deixa os internos de lado.
+    const info = Object.fromEntries(models.map((id) => { const c = catalog[id]; return [id, { name: c.name, context: c.context, maxOutput: c.maxOutput, internal: c.internal }]; }));
+    return { models, prices: {}, info };
+  }
+  let url, headers, accountNote = null, req = null;
+  if (p.type === 'oauth') {
+    // Provedor com conta: a ficha diz onde fica a lista de modelos e com quais cabeçalhos.
+    const cred = await accountOf(p).credential(store, p, k);
+    accountNote = cred.extra?.mintError ?? null; // Muse Code: por que a Meta não entregou a chave
+    req = modelsRequest(p, cred);
+    if (!req) throw new Error(K('Este provedor não publica a lista de modelos. Adicione o modelo pelo identificador.'));
+    // Provedor sem lista pública: a lista conhecida vem na própria ficha.
+    if (req.catalog) return { models: [...req.catalog].sort(), prices: {}, info: {} };
+    ({ url, headers } = req);
+  } else {
+    url = p.type === 'anthropic' ? joinUrl(p.baseUrl, 'anthropic').replace(/\/messages$/, '/models?limit=1000') : joinUrl(p.baseUrl, 'openai').replace(/\/chat\/completions$/, '/models');
+    headers = { ...authHeaders(p, k ? store.keyValue(p, k) : null), ...store.headersOf(p), ...(p.type === 'anthropic' && { 'anthropic-version': '2023-06-01' }) };
+  }
   const up = await send({ url, method: 'GET', headers, timeoutMs: 15000, allowPrivate: p.allowPrivateNetwork });
   const text = await readText(up.stream, 16 * 1024 * 1024);
+  if (up.status !== 200 && accountNote) throw new LocalError('O provedor respondeu HTTP {0}: {1}. Ao conectar a conta: {2}', up.status, parseUpstreamError(up.status, text).message, accountNote);
   if (up.status !== 200) throw new LocalError('O provedor respondeu HTTP {0}: {1}', up.status, parseUpstreamError(up.status, text).message);
   const j = safeParse(text);
-  const list = j?.data ?? j?.models ?? (Array.isArray(j) ? j : null);
-  if (!Array.isArray(list)) throw new Error(K('O provedor não devolveu uma lista de modelos.'));
-  const idOf = (x) => String(typeof x === 'string' ? x : x.id ?? x.name ?? '').replace(/^models\//, '');
+  const raw = req?.pick ? req.pick(j) : j?.data ?? j?.models ?? (Array.isArray(j) ? j : null);
+  if (!Array.isArray(raw)) throw new Error(K('O provedor não devolveu uma lista de modelos.'));
+  // ChatGPT: { models: [{ slug, visibility }] }; só os visíveis na lista valem.
+  const list = raw.filter((x) => typeof x !== 'object' || !x?.visibility || x.visibility === 'list').filter((x) => !req?.filter || req.filter(x));
+  const idOf = (x) => String(typeof x === 'string' ? x : x.id ?? x.slug ?? x.name ?? '').replace(/^models\//, '');
   const perMillion = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.round(n * 1e6 * 10000) / 10000 : null; };
   const prices = {};
+  // Segunda lista do provedor (Cline: gratuitos e recomendados do seletor). Os gratuitos ganham preço zero.
+  // Se ela falhar, fica só a primeira.
+  if (req?.also) {
+    const extra = await send({ url: req.also.url, method: 'GET', headers: { accept: 'application/json' }, timeoutMs: 15000 }).then(async (r) => (r.status === 200 ? safeParse(await readText(r.stream, 4 * 1024 * 1024)) : null)).catch(() => null);
+    const { free, other } = extra ? req.also.pick(extra) : {};
+    const seen = new Set(list.map(idOf));
+    for (const [bucket, isFree] of [[free, true], [other, false]]) {
+      for (const x of Array.isArray(bucket) ? bucket : []) {
+        const id = idOf(x ?? '');
+        if (!id || id.startsWith('cline-pass/')) continue;
+        if (isFree) prices[id] = { in: 0, out: 0 };
+        if (!seen.has(id)) { seen.add(id); list.push(x); }
+      }
+    }
+  }
   for (const x of list) {
     const pr = typeof x === 'object' && x?.pricing;
-    if (!pr) continue;
+    if (!pr || prices[idOf(x)]) continue;
     const pin = perMillion(pr.prompt ?? pr.input), pout = perMillion(pr.completion ?? pr.output);
     if (pin !== null || pout !== null) prices[idOf(x)] = { in: pin, out: pout };
   }
   const models = list.map(idOf).filter(Boolean).sort().slice(0, 1000);
-  return { models, prices };
+  // Contexto e limite de saída, quando o provedor informa. Cada um usa um nome: OpenRouter (context_length,
+  // top_provider.max_completion_tokens), Anthropic (max_input_tokens/max_tokens), vLLM (max_model_len), outros.
+  const intOf = (...vals) => { for (const v of vals) { const n = Number(v); if (Number.isInteger(n) && n > 0) return n; } return null; };
+  const info = {};
+  for (const x of list) {
+    if (!x || typeof x !== 'object') continue;
+    const context = intOf(x.context_length, x.context_window, x.max_input_tokens, x.max_context_length, x.max_model_len, x.top_provider?.context_length, x.inputTokenLimit, x.limits?.max_input_tokens);
+    const maxOutput = intOf(x.top_provider?.max_completion_tokens, x.max_output_tokens, x.max_completion_tokens, x.outputTokenLimit, x.limits?.max_output_tokens);
+    const name = typeof x.name === 'string' && x.name !== x.id ? x.name.slice(0, 80) : typeof x.display_name === 'string' ? x.display_name.slice(0, 80) : null;
+    if (context || maxOutput) info[idOf(x)] = { name, context, maxOutput, internal: false };
+  }
+  return { models, prices, info };
 }

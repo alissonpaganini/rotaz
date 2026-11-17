@@ -1,8 +1,7 @@
 // Cliente fala OpenAI Chat Completions; provedor fala Anthropic Messages.
-import { genId, safeParse, STOP_TO_FINISH } from './common.js';
+import { genId, safeParse, STOP_TO_FINISH, TranslationError } from './common.js';
 
 const DEFAULT_MAX_TOKENS = 4096;
-export class TranslationError extends Error {}
 
 function imageBlock(url) {
   const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);

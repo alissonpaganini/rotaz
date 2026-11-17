@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import updaterPkg from 'electron-updater'; // MIT, do mesmo projeto do electron-builder
@@ -48,8 +49,91 @@ const lang = () => (i18n ? i18n.resolveLang(gateway?.store.ui.lang ?? 'auto') : 
 /** Traduz um texto (com {0}, {1}… para os argumentos). Sem os dicionários carregados, fica em português. */
 const T = (key, ...args) => (i18n ? i18n.tr(lang(), new i18n.LocalError(key, ...args)) : key.replace(/\{(\d+)\}/g, (m, i) => args[i] ?? m));
 
-if (!app.requestSingleInstanceLock()) app.quit();
-const APP_ID = 'dev.rotaz.app'; // = build.appId em package.json
+// Segunda cópia: só avisa a primeira (second-instance) e sai, sem subir gateway, bandeja nem janela.
+const primary = app.requestSingleInstanceLock();
+if (!primary) app.quit();
+
+// ---------- um Rotaz por vez ----------
+/**
+ * Trava entre todos os apps Rotaz desta conta do sistema. A trava acima é do Electron e vale por app: o Rotaz e o
+ * Rotaz Teste são apps diferentes para ele e abriam juntos, brigando pelo mesmo endereço e pela mesma porta (e, ao
+ * achar a porta ocupada, um abria o painel do outro). Esta é um canal local, um pipe no Windows e um socket nos
+ * outros sistemas: só um app consegue abrir, e ele some sozinho quando o app fecha, sem arquivo esquecido.
+ * Execuções isoladas de teste (ROTAZ_USER_DATA, com dados e porta próprios) ficam de fora.
+ */
+const APP_LOCK = process.platform === 'win32'
+  ? `\\\\.\\pipe\\rotaz-desktop-${os.userInfo().username}`
+  : path.join(os.tmpdir(), `rotaz-desktop-${os.userInfo().uid}.sock`);
+let appLock = null; // fica aberto enquanto o app roda
+
+/** Pergunta ao Rotaz que segura a trava quem ele é ('who') ou pede que mostre a janela ('show'). */
+function askLockHolder(cmd) {
+  return new Promise((resolve) => {
+    const c = net.connect(APP_LOCK);
+    let reply = '';
+    c.setEncoding('utf8');
+    c.setTimeout(2000, () => { c.destroy(); resolve(null); });
+    c.on('connect', () => c.write(`${cmd}\n`));
+    c.on('data', (d) => { reply += d; });
+    c.on('end', () => { try { resolve(JSON.parse(reply).product || 'Rotaz'); } catch { resolve('Rotaz'); } });
+    c.on('error', () => resolve(null));
+  });
+}
+
+/** Pega a trava. Devolve null quando conseguiu (ou quando não há como travar) e o nome do outro app quando ele já está aberto. */
+async function holdAppLock() {
+  if (process.env.ROTAZ_USER_DATA) return null;
+  const listen = () => new Promise((resolve, reject) => {
+    const srv = net.createServer((sock) => {
+      sock.setEncoding('utf8');
+      sock.on('error', () => {});
+      sock.once('data', (msg) => {
+        if (String(msg).trim() === 'show') {
+          showWindow();
+          // O pedido vem de outro processo, e o Windows só faria a janela piscar na barra: sobe-a um instante acima das outras.
+          if (win) {
+            win.setAlwaysOnTop(true); win.moveTop(); win.focus();
+            setTimeout(() => { if (win && !win.isDestroyed()) win.setAlwaysOnTop(false); }, 800);
+          }
+        }
+        sock.end(JSON.stringify({ product: app.getName() }));
+      });
+    });
+    srv.once('error', reject);
+    srv.listen(APP_LOCK, () => { srv.removeListener('error', reject); resolve(srv); });
+  });
+  try { appLock = await listen(); return null; } catch (e) {
+    if (e.code !== 'EADDRINUSE') return null; // sem como travar, o app segue como antes
+    const other = await askLockHolder('who');
+    if (other) return other;
+    // socket esquecido por um app encerrado à força (macOS e Linux): apaga e pega a trava
+    if (process.platform !== 'win32') { try { fs.rmSync(APP_LOCK, { force: true }); appLock = await listen(); } catch { /* segue sem trava */ } }
+    return null;
+  }
+}
+
+/** Outro Rotaz já está aberto: explica, oferece mostrar a janela dele e sai sem subir nada. */
+async function blockedBy(other) {
+  await loadI18n();
+  const me = app.getName();
+  const { response } = await dialog.showMessageBox({
+    type: 'info', title: me, noLink: true, defaultId: 0, cancelId: 1,
+    message: T('O {0} já está aberto', other),
+    detail: T('Feche o {0} antes de abrir o {1}. Os dois usam o mesmo endereço e a mesma porta, e abertos juntos um atrapalharia o outro.', other, me),
+    buttons: [T('Mostrar o {0}', other), T('Fechar')],
+  });
+  if (response === 0) await askLockHolder('show');
+  app.exit(0);
+}
+/**
+ * Identidade do app no Windows (AppUserModelID): decide o ícone da barra de tarefas, o agrupamento das janelas e de
+ * quem são os avisos. Tem de ser igual ao `appId` do build, que o instalador grava nos atalhos. Cada build leva a sua
+ * em package.json (`appUserModelId`; o Rotaz Teste troca por `-c.extraMetadata.appUserModelId=dev.rotaz.teste`).
+ * Sem compilar, quem roda é o electron.exe: usa outra identidade, para o Windows não guardar o ícone do Electron
+ * na identidade do app de verdade (era isso que deixava o átomo do Electron na barra de tarefas).
+ */
+const APP_META = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')); } catch { return {}; } })();
+const APP_ID = app.isPackaged ? (APP_META.appUserModelId ?? 'dev.rotaz.app') : 'dev.rotaz.dev';
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID); // identidade dos avisos no Windows
 
 /**
@@ -60,11 +144,13 @@ if (process.platform === 'win32') app.setAppUserModelId(APP_ID); // identidade d
  */
 function repairStartMenuShortcut() {
   if (process.platform !== 'win32' || !app.isPackaged) return;
-  const lnk = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Rotaz.lnk');
+  // o nome do produto (Rotaz ou Rotaz Teste) é o do atalho e o do executável
+  const name = app.getName();
+  const lnk = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', `${name}.lnk`);
   try {
     if (!fs.existsSync(lnk)) return;
     const s = shell.readShortcutLink(lnk);
-    if (path.basename(s.target).toLowerCase() !== 'rotaz.exe' || s.appUserModelId === APP_ID) return;
+    if (path.basename(s.target).toLowerCase() !== `${name}.exe`.toLowerCase() || s.appUserModelId === APP_ID) return;
     shell.writeShortcutLink(lnk, 'update', { appUserModelId: APP_ID });
   } catch { /* atalho ilegível: os avisos podem não aparecer, mas o app segue */ }
 }
@@ -99,12 +185,17 @@ const probe = (port) => new Promise((resolve) => {
   req.on('timeout', () => { req.destroy(); resolve(false); });
 });
 
+/** Dicionários do servidor para a bandeja e os avisos. "Automático" = idioma do sistema, como o Windows ou o macOS informam. */
+async function loadI18n() {
+  if (i18n) return;
+  i18n = await import(pathToFileURL(path.join(serverRoot, 'src', 'i18n.js')).href);
+  if (!process.env.ROTAZ_LANG) process.env.ROTAZ_LANG = i18n.detect([...(app.getPreferredSystemLanguages?.() ?? []), app.getLocale()]);
+}
+
 async function startGateway() {
   const { createServer } = await import(pathToFileURL(path.join(serverRoot, 'src', 'index.js')).href);
-  i18n = await import(pathToFileURL(path.join(serverRoot, 'src', 'i18n.js')).href);
-  // "Automático" no app = idioma do sistema operacional, como o Windows ou o macOS informam
+  await loadI18n();
   process.env.ROTAZ_VERSION = app.getVersion(); // a tela Sobre e os backups mostram a versão do app
-  if (!process.env.ROTAZ_LANG) process.env.ROTAZ_LANG = i18n.detect([...(app.getPreferredSystemLanguages?.() ?? []), app.getLocale()]);
   const { setAutoStartHandler } = await import(pathToFileURL(path.join(serverRoot, 'src', 'autostart.js')).href);
   setAutoStartHandler({
     label: 'Iniciar com o sistema',
@@ -119,16 +210,16 @@ async function startGateway() {
     if (e.code !== 'EADDRINUSE') throw e;
     const p = instance.store.server.port;
     await instance.close();
-    // Já existe um Rotaz (ex.: a versão de terminal) nesta porta: o app abre esse painel em vez de brigar por ela.
+    // Outro app Rotaz não chega aqui (a trava acima o barra antes); sobra a versão de terminal (npm start) nesta
+    // porta: o app abre esse painel em vez de brigar por ela.
     if (await probe(p)) { panelUrl = `http://127.0.0.1:${p}/`; return; }
     throw new i18n.LocalError('A porta {0} está ocupada por outro programa. Feche-o ou troque a porta do Rotaz.', p);
   }
   gateway = instance;
   // Versões anteriores guardavam a ação ao fechar na configuração do gateway: migra uma vez.
   if (prefs.closeAction === undefined && ['tray', 'quit'].includes(instance.store.server.closeAction)) savePrefs({ closeAction: instance.store.server.closeAction });
-  // Mudanças feitas pelo painel (ex.: iniciar com o sistema) refletem na hora no menu da bandeja.
-  const update = instance.store.updateServer.bind(instance.store);
-  instance.store.updateServer = (input) => { const r = update(input); buildTrayMenu(); autoUpdater.autoInstallOnAppQuit = updatesEnabled(); return r; };
+  // Qualquer mudança gravada (iniciar com o sistema, idioma, atualizações) reflete na hora na bandeja.
+  instance.store.on('change', () => { buildTrayMenu(); autoUpdater.autoInstallOnAppQuit = updatesEnabled(); });
   // Orçamento: avisa uma vez por período ao chegar perto do limite e ao atingi-lo.
   instance.budget.onAlert(({ period, level, spent, limit, currency, action }) => {
     const fmt = (v) => new Intl.NumberFormat(lang(), { style: 'currency', currency }).format(v);
@@ -139,9 +230,6 @@ async function startGateway() {
       : T('Os pedidos continuam normalmente; só o aviso está ativo.');
     showNotice(T('Limite de gastos atingido'), `${amount} ${what}`);
   });
-  // Trocar o idioma no painel traduz a bandeja na hora.
-  const updateUi = instance.store.updateUi.bind(instance.store);
-  instance.store.updateUi = (input) => { const r = updateUi(input); buildTrayMenu(); return r; };
   const { port: actual } = instance.store.server;
   panelUrl = `http://127.0.0.1:${actual}/`;
   // O registro de inicialização segue o que está salvo no painel.
@@ -186,7 +274,7 @@ function createWindow() {
 }
 
 // Controles da janela pedidos pela barra de título do painel. Só aceita a janela do app e o painel local.
-const fromPanel = (e) => win && e.sender === win.webContents && panelUrl && new URL(e.senderFrame.url).origin === new URL(panelUrl).origin;
+const fromPanel = (e) => win && e.sender === win.webContents && panelUrl && !!e.senderFrame && new URL(e.senderFrame.url).origin === new URL(panelUrl).origin;
 ipcMain.on('rotaz:window', (e, action) => {
   if (!fromPanel(e)) return;
   if (action === 'minimize') win.minimize();
@@ -222,7 +310,7 @@ function savePrefs(patch) {
   fs.mkdirSync(path.dirname(prefsFile), { recursive: true });
   const tmp = `${prefsFile}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-  fs.renameSync(tmp, prefsFile); // gravação atômica
+  fs.renameSync(tmp, prefsFile);
   prefs = next;
   buildTrayMenu();
 }
@@ -342,7 +430,8 @@ function buildTrayMenu() {
     { label: running, enabled: false },
     { type: 'separator' },
     { label: T('Iniciar com o sistema'), type: 'checkbox', checked: loginItemOn(), enabled: !!gateway,
-      click: (item) => { gateway.store.updateServer({ autoStart: item.checked }); setLoginItem(item.checked); } },
+      // Registro primeiro: a mudança gravada redesenha a bandeja, e a marcação lê o registro (loginItemOn).
+      click: (item) => { setLoginItem(item.checked); gateway.store.updateServer({ autoStart: item.checked }); } },
     { label: T('Ao fechar a janela'), submenu: [
       { label: T('Manter na bandeja'), type: 'radio', checked: closeAction() === 'tray', click: () => setCloseAction('tray') },
       { label: T('Encerrar o Rotaz'), type: 'radio', checked: closeAction() === 'quit', click: () => setCloseAction('quit') },
@@ -364,6 +453,9 @@ function createTray() {
 }
 
 app.whenReady().then(async () => {
+  if (!primary) return;
+  const other = await holdAppLock();
+  if (other) { await blockedBy(other); return; }
   repairStartMenuShortcut();
   try { await startGateway(); } catch (e) {
     dialog.showErrorBox(T('Rotaz não conseguiu iniciar'), i18n ? i18n.tr(lang(), e) : e.message);

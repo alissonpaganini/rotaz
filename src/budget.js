@@ -26,7 +26,7 @@ export class Budget {
     this.fired = new Set(); // avisos já dados neste período (dia ou mês + nível)
   }
 
-  get config() { return { ...BUDGET_DEFAULTS, ...this.store.c.budget }; }
+  get config() { return this.store.budget; }
 
   /** Gasto do dia e do mês na moeda de exibição, comparado com os limites. */
   state() {

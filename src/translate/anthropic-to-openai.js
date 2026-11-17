@@ -1,31 +1,12 @@
 // Cliente fala Anthropic Messages (Claude Code); provedor fala OpenAI Chat Completions.
 import crypto from 'node:crypto';
-import { genId, safeParse, FINISH_TO_STOP, ToolNames, sse, estimateTokens, toolExtras } from './common.js';
-
-export const GW_REASONING_SIGNATURE = 'gateway-reasoning';
-
-const blocks = (c) => (typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []);
-
-// Bloco interno do Claude Code, sem valor para o modelo e sem motivo para sair da máquina.
-const INTERNAL_SYSTEM = /^x-anthropic-billing-header:/;
-
-function systemText(system) {
-  return blocks(system).filter((b) => b?.type === 'text' && !INTERNAL_SYSTEM.test(b.text)).map((b) => b.text).join('\n\n');
-}
+import { genId, safeParse, FINISH_TO_STOP, ToolNames, toolExtras, blocks, systemText, documentText, REASONING_SIGNATURE, AnthropicStreamWriter } from './common.js';
 
 function imagePart(b) {
   const s = b.source;
   if (s?.type === 'base64') return { type: 'image_url', image_url: { url: `data:${s.media_type};base64,${s.data}` } };
   if (s?.type === 'url') return { type: 'image_url', image_url: { url: s.url } };
   return null;
-}
-
-function documentText(b) {
-  const s = b.source;
-  const title = b.title ? `${b.title}\n` : '';
-  if (s?.type === 'text') return `${title}${s.data}`;
-  if (s?.type === 'base64' && /^text\//.test(s.media_type || '')) return `${title}${Buffer.from(s.data, 'base64').toString('utf8')}`;
-  return `[Documento omitido: ${b.title || s?.media_type || 'formato'} não é suportado por este provedor]`;
 }
 
 function toolResultContent(b) {
@@ -72,7 +53,7 @@ function convertAssistant(content, out, names) {
       const extra = toolExtras.get(b.id);
       if (extra) call.extra_content = extra;
       calls.push(call);
-    } else if (b?.type === 'thinking' && b.signature === GW_REASONING_SIGNATURE) reasoning += b.thinking;
+    } else if (b?.type === 'thinking' && b.signature === REASONING_SIGNATURE) reasoning += b.thinking;
   }
   if (!texts.length && !calls.length) return;
   const m = { role: 'assistant', content: texts.join('\n') || null };
@@ -184,7 +165,7 @@ export function openAIResponseToAnthropic(r, { alias, names, thinking }) {
   const m = choice.message ?? {};
   const content = [];
   const reasoning = reasoningOf(m);
-  if (reasoning && thinking) content.push({ type: 'thinking', thinking: reasoning, signature: GW_REASONING_SIGNATURE });
+  if (reasoning && thinking) content.push({ type: 'thinking', thinking: reasoning, signature: REASONING_SIGNATURE });
   const text = typeof m.content === 'string' ? m.content
     : Array.isArray(m.content) ? m.content.map((p) => p.text ?? '').join('') : '';
   if (text) content.push({ type: 'text', text });
@@ -202,65 +183,18 @@ export function openAIResponseToAnthropic(r, { alias, names, thinking }) {
  * Máquina de estados: chunks OpenAI -> eventos Anthropic. Blocos saem estritamente em sequência;
  * chamadas paralelas intercaladas ficam em buffer e saem completas na ordem de chegada.
  */
-export class OpenAIToAnthropicStream {
-  constructor({ alias, names, thinking, inputEstimate = 0 }) {
-    Object.assign(this, { alias, names, thinking, inputEstimate });
-    this.id = genId('msg_');
-    this.started = false;
-    this.index = -1;
-    this.open = null;      // 'text' | 'thinking' | objeto da ferramenta
+export class OpenAIToAnthropicStream extends AnthropicStreamWriter {
+  constructor(opts) {
+    super(opts);
     this.tools = [];
     this.byIndex = new Map();
     this.finish = null;
     this.usage = null;
-    this.finished = false;
-    this.outChars = 0;
-    this.upstreamError = null;
-  }
-
-  start() {
-    if (this.started) return '';
-    this.started = true;
-    return sse('message_start', {
-      type: 'message_start',
-      message: { id: this.id, type: 'message', role: 'assistant', model: this.alias, content: [], stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: this.inputEstimate, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } },
-    }) + sse('ping', { type: 'ping' });
-  }
-
-  closeOpen() {
-    if (this.open === null) return '';
-    if (typeof this.open === 'object') this.open.done = true;
-    let s = '';
-    if (this.open === 'thinking') s += sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta: { type: 'signature_delta', signature: GW_REASONING_SIGNATURE } });
-    this.open = null;
-    return s + sse('content_block_stop', { type: 'content_block_stop', index: this.index });
-  }
-
-  openBlock(kind, block) {
-    let s = this.closeOpen();
-    this.index++;
-    this.open = kind;
-    s += sse('content_block_start', { type: 'content_block_start', index: this.index, content_block: block });
-    return s;
-  }
-
-  textDelta(kind, text) {
-    let s = '';
-    if (this.open !== kind) s += this.openBlock(kind, kind === 'text' ? { type: 'text', text: '' } : { type: 'thinking', thinking: '', signature: '' });
-    this.outChars += text.length;
-    const delta = kind === 'text' ? { type: 'text_delta', text } : { type: 'thinking_delta', thinking: text };
-    return s + sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta });
   }
 
   startTool(t) {
     t.started = true;
     return this.openBlock(t, { type: 'tool_use', id: t.id, name: this.names.original(t.name), input: {} });
-  }
-
-  argDelta(partial) {
-    this.outChars += partial.length;
-    return sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta: { type: 'input_json_delta', partial_json: partial } });
   }
 
   toolDelta(tc) {
@@ -303,30 +237,18 @@ export class OpenAIToAnthropicStream {
     return s;
   }
 
-  /** Fecha a mensagem. `complete=false` indica corte do upstream: vira erro, nunca fim normal. */
   end(complete) {
-    if (this.finished) return '';
-    this.finished = true;
-    let s = this.start();
-    if (this.upstreamError || !complete) {
-      const message = this.upstreamError?.message ?? 'A conexão com o provedor terminou antes do fim da resposta.';
-      return s + this.closeOpen() + sse('error', { type: 'error', error: { type: 'api_error', message: String(message).slice(0, 1000) } });
-    }
-    s += this.closeOpen();
-    for (const t of this.tools) {
-      if (t.started) continue;
-      s += this.startTool(t);
-      if (t.buf) s += this.argDelta(t.buf);
-      t.buf = '';
-      s += this.closeOpen();
-    }
-    const usage = this.usage ? mapUsage(this.usage)
-      : { input_tokens: this.inputEstimate, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: estimateTokens('x'.repeat(this.outChars)) };
-    const stop = this.tools.length ? 'tool_use' : FINISH_TO_STOP[this.finish] ?? 'end_turn';
-    this.finalUsage = usage;
-    return s + sse('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage })
-      + sse('message_stop', { type: 'message_stop' });
+    return this.close(complete, () => {
+      // Ferramentas que chegaram sem nome a tempo de abrir o bloco: saem agora, inteiras.
+      let before = '';
+      for (const t of this.tools) {
+        if (t.started) continue;
+        before += this.startTool(t);
+        if (t.buf) before += this.argDelta(t.buf);
+        t.buf = '';
+        before += this.closeOpen();
+      }
+      return { before, usage: this.usage ? mapUsage(this.usage) : this.estimatedUsage(), stop: this.tools.length ? 'tool_use' : FINISH_TO_STOP[this.finish] ?? 'end_turn' };
+    });
   }
-
-  ping() { return sse('ping', { type: 'ping' }); }
 }

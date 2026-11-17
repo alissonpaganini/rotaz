@@ -1,5 +1,5 @@
-# Gera os instaladores do Rotaz: .exe (Windows), .dmg (macOS universal, Intel e Apple Silicon) e .AppImage (Linux x64).
-# Dispara ao publicar uma tag "v*" ou manualmente pela aba Actions. Com tag, publica uma Release com os três
+# Gera os instaladores do Rotaz: .exe (Windows), .dmg (macOS universal, Intel e Apple Silicon), .AppImage e .deb (Linux x64).
+# Dispara ao publicar uma tag "v*" ou manualmente pela aba Actions. Com tag, publica uma Release com os
 # instaladores.
 # Sem certificados configurados, os instaladores saem sem assinatura (veja README, "Assinatura").
 name: Instaladores
@@ -23,7 +23,7 @@ jobs:
           - os: macos-latest
             args: --mac
           - os: ubuntu-latest
-            args: --linux AppImage --x64
+            args: --linux AppImage deb --x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +63,7 @@ jobs:
             desktop/dist/*.exe
             desktop/dist/*.dmg
             desktop/dist/*.AppImage
+            desktop/dist/*.deb
             # Usados pela atualização automática: o app lê latest.yml e baixa só o que mudou com o .blockmap.
             desktop/dist/*.blockmap
             desktop/dist/latest*.yml
@@ -89,14 +90,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          # Notas: a seção "## <versão>" do CHANGELOG.md; sem ela, as notas automáticas do GitHub.
+          # Notas da Release: primeiro, qual arquivo baixar (montado com os arquivos que o build gerou de fato);
+          # depois, as novidades da seção "## <versão>" do CHANGELOG.md. Sem essa seção, entram as notas automáticas.
           v="${GITHUB_REF_NAME#v}"
-          awk -v v="$v" 'index($0, "## " v " ") == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notas.md
-          if [ -s notas.md ]; then
-            echo "" >> notas.md
-            echo "**Lista completa de mudanças:** ${{ github.server_url }}/${{ github.repository }}/commits/${GITHUB_REF_NAME}" >> notas.md
-            notes=(--notes-file notas.md)
+          url="${{ github.server_url }}/${{ github.repository }}"
+          row() { # sistema, padrão do nome do arquivo, como instalar
+            f=$(cd instaladores && ls $2 2>/dev/null | head -n1)
+            if [ -n "$f" ]; then echo "| $1 | [\`$f\`]($url/releases/download/$GITHUB_REF_NAME/$f) | $3 |"; fi
+          }
+          {
+            echo "## Download"
+            echo
+            echo "Download **only the file for your system**. · Baixe **só o arquivo do seu sistema**."
+            echo
+            echo "| System · Sistema | File · Arquivo | How to install · Como instalar |"
+            echo "| --- | --- | --- |"
+            row "Windows 10/11" "*-Windows-x64-Setup.exe" "Run the installer · Rode o instalador"
+            row "macOS (Apple Silicon, Intel)" "*-macOS-universal.dmg" "Open it and drag Rotaz to Applications · Abra e arraste o Rotaz para Aplicativos"
+            row "Ubuntu, Debian" "*-Linux-*.deb" "\`sudo apt install ./<file>\`"
+            row "Linux x64" "*-Linux-*.AppImage" "\`chmod +x\` and open it · \`chmod +x\` e abra"
+            echo
+            echo "- **Already using Rotaz on Windows?** It updates itself, no download needed. · **Já usa o Rotaz no Windows?** Ele se atualiza sozinho."
+            echo "- **Ignore** the \`.yml\` and \`.blockmap\` files: they are for automatic updates. · **Ignore** os arquivos \`.yml\` e \`.blockmap\`: são da atualização automática."
+            echo "- The installers aren't code-signed yet, so your system asks for confirmation the first time. · Os instaladores ainda não têm assinatura digital: o sistema pede confirmação na primeira vez."
+          } > notas.md
+          awk -v v="$v" 'index($0, "## " v " ") == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > novidades.md
+          notes=(--notes-file notas.md)
+          if [ -s novidades.md ]; then
+            { echo; echo "## What's new · Novidades"; cat novidades.md; echo; echo "**Full changelog · Todas as mudanças:** $url/commits/$GITHUB_REF_NAME"; } >> notas.md
           else
-            notes=(--generate-notes)
+            notes+=(--generate-notes)
           fi
           gh release create "$GITHUB_REF_NAME" instaladores/* --repo "${{ github.repository }}" --title "Rotaz $GITHUB_REF_NAME" "${notes[@]}"

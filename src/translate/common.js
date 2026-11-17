@@ -3,6 +3,9 @@ import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { redact } from '../security.js';
 
+/** Pedido que nenhum provedor atenderia como veio: volta ao cliente como 400, sem tentar outro alvo. */
+export class TranslationError extends Error {}
+
 export const genId = (prefix) => `${prefix}${crypto.randomBytes(12).toString('hex')}`;
 
 export function safeParse(s, fallback = null) {
@@ -104,4 +107,116 @@ export const toOpenAIError = (status, message, code = null) => ({
 export function estimateTokens(value) {
   const s = typeof value === 'string' ? value : JSON.stringify(value ?? '');
   return Math.ceil(s.length / 3.6);
+}
+
+// ---------- conteúdo no formato Anthropic, lido pelos tradutores de pedido ----------
+
+/** `content` de uma mensagem como lista de blocos (string vira um bloco de texto). */
+export const blocks = (c) => (typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []);
+
+/** Cabeçalho de cobrança que o Claude Code põe no system: é da Anthropic, outro provedor não precisa ver. */
+const INTERNAL_SYSTEM = /^x-anthropic-billing-header:/;
+
+/** Texto do system sem os blocos internos do Claude Code. */
+export const systemText = (system) => blocks(system).filter((b) => b?.type === 'text' && !INTERNAL_SYSTEM.test(b.text)).map((b) => b.text).join('\n\n');
+
+/** Assinatura do raciocínio que o próprio gateway monta (de reasoning_content, thought etc.): na volta, vira raciocínio de novo. */
+export const REASONING_SIGNATURE = 'gateway-reasoning';
+
+/** Documento como texto: os provedores não Anthropic só recebem documentos de texto. */
+export function documentText(b) {
+  const s = b?.source;
+  const title = b?.title ? `${b.title}\n` : '';
+  if (s?.type === 'text') return `${title}${s.data}`;
+  if (s?.type === 'base64' && /^text\//.test(s.media_type || '')) return `${title}${Buffer.from(s.data, 'base64').toString('utf8')}`;
+  return `[Documento omitido: ${b?.title || s?.media_type || 'formato'} não é suportado por este provedor]`;
+}
+
+// ---------- saída em eventos Anthropic, comum aos tradutores de stream ----------
+
+const CUT_MESSAGE = 'A conexão com o provedor terminou antes do fim da resposta.';
+
+/**
+ * Escreve a sequência de eventos que o Claude Code espera: message_start, blocos (texto, raciocínio, ferramenta)
+ * abertos e fechados em ordem, e o fim com message_delta + message_stop, ou um evento de erro quando o
+ * provedor cortou a resposta. Cada tradutor de stream só decide o que vira bloco.
+ */
+export class AnthropicStreamWriter {
+  constructor({ alias, names, thinking, inputEstimate = 0 }) {
+    Object.assign(this, { alias, names, thinking, inputEstimate });
+    this.id = genId('msg_');
+    this.started = false;
+    this.index = -1;
+    this.open = null; // 'text' | 'thinking' | objeto da ferramenta
+    this.finished = false;
+    this.outChars = 0;
+    this.upstreamError = null;
+    this.passthrough = false;
+  }
+
+  start() {
+    if (this.started) return '';
+    this.started = true;
+    return sse('message_start', {
+      type: 'message_start',
+      message: { id: this.id, type: 'message', role: 'assistant', model: this.alias, content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: this.inputEstimate, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 } },
+    }) + sse('ping', { type: 'ping' });
+  }
+
+  closeOpen() {
+    if (this.open === null) return '';
+    if (typeof this.open === 'object') this.open.done = true;
+    let s = '';
+    if (this.open === 'thinking') s += sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta: { type: 'signature_delta', signature: REASONING_SIGNATURE } });
+    this.open = null;
+    return s + sse('content_block_stop', { type: 'content_block_stop', index: this.index });
+  }
+
+  openBlock(kind, block) {
+    const s = this.closeOpen();
+    this.index++;
+    this.open = kind;
+    return s + sse('content_block_start', { type: 'content_block_start', index: this.index, content_block: block });
+  }
+
+  textDelta(kind, text) {
+    if (!text) return '';
+    let s = '';
+    if (this.open !== kind) s += this.openBlock(kind, kind === 'text' ? { type: 'text', text: '' } : { type: 'thinking', thinking: '', signature: '' });
+    this.outChars += text.length;
+    const delta = kind === 'text' ? { type: 'text_delta', text } : { type: 'thinking_delta', thinking: text };
+    return s + sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta });
+  }
+
+  argDelta(partial) {
+    this.outChars += partial.length;
+    return sse('content_block_delta', { type: 'content_block_delta', index: this.index, delta: { type: 'input_json_delta', partial_json: partial } });
+  }
+
+  /** Uso quando o provedor não informa: a entrada estimada no início e a saída pelo tamanho do que foi escrito. */
+  estimatedUsage() {
+    return { input_tokens: this.inputEstimate, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: Math.ceil(this.outChars / 3.6) };
+  }
+
+  /**
+   * Fecha a mensagem. `complete=false` é corte do provedor: vira erro, nunca fim normal. `finalize` roda depois de
+   * fechar o bloco aberto e devolve o que ainda falta escrever (`before`), o uso e o stop_reason.
+   */
+  close(complete, finalize) {
+    if (this.finished) return '';
+    this.finished = true;
+    const s = this.start();
+    if (this.upstreamError || !complete) {
+      const message = this.upstreamError?.message ?? CUT_MESSAGE;
+      return s + this.closeOpen() + sse('error', { type: 'error', error: { type: 'api_error', message: String(message).slice(0, 1000) } });
+    }
+    const opened = this.closeOpen();
+    const { before = '', usage, stop } = finalize();
+    this.finalUsage = usage;
+    return s + opened + before + sse('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage })
+      + sse('message_stop', { type: 'message_stop' });
+  }
+
+  ping() { return sse('ping', { type: 'ping' }); }
 }

@@ -8,7 +8,7 @@ import { LocalError } from './i18n.js';
 export const BACKUP_KIND = 'rotaz-backup';
 export const BACKUP_VERSION = 1;
 const SCRYPT = { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
-const MODEL_FIELDS = ['alias', 'upstream', 'displayName', 'enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam', 'priceIn', 'priceOut'];
+const MODEL_FIELDS = ['alias', 'upstream', 'displayName', 'enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam', 'priceIn', 'priceOut', 'contextWindow'];
 const SERVER_FIELDS = ['timeoutMs', 'maxBodyMB', 'rateLimitPerMin', 'maxConcurrent', 'maxAttempts', 'logLevel'];
 
 const keyFrom = (password, salt) => crypto.scryptSync(String(password), salt, 32, SCRYPT);
@@ -35,13 +35,16 @@ export function exportProfile(store, { password, appVersion } = {}) {
   const secrets = { keys: {}, headers: {} };
   const providers = store.providers.map((p, i) => {
     if (withSecrets) {
-      p.keys.forEach((k, j) => { secrets.keys[`${i}:${j}`] = store.keyValue(p, k); });
+      p.keys.forEach((k, j) => {
+        // Antigravity: o "segredo" é a credencial OAuth (refresh token + projectId), não uma chave de API.
+        secrets.keys[`${i}:${j}`] = p.type === 'antigravity' ? JSON.stringify(store.credentialOf(p, k) ?? {}) : p.type === 'oauth' ? JSON.stringify(store.oauthAccount(p, k) ?? {}) : store.keyValue(p, k);
+      });
       const h = store.headersOf(p);
       if (h && Object.keys(h).length) secrets.headers[i] = h;
     }
     return {
       name: p.name, type: p.type, baseUrl: p.baseUrl, authScheme: p.authScheme, allowPrivateNetwork: p.allowPrivateNetwork,
-      enabled: p.enabled, priority: p.priority, rpm: p.rpm, presetId: p.presetId ?? null,
+      enabled: p.enabled, priority: p.priority, rpm: p.rpm, presetId: p.presetId ?? null, ...(p.oauth && { oauth: p.oauth }),
       keys: p.keys.map((k) => ({ label: k.label, enabled: k.enabled })),
       models: p.models.map((m) => Object.fromEntries(MODEL_FIELDS.map((f) => [f, m[f] ?? null]))),
     };
@@ -52,7 +55,7 @@ export function exportProfile(store, { password, appVersion } = {}) {
     config: {
       providers,
       routing: { ...routing, tiers: { ...tiers } },
-      budget: store.c.budget ? { ...store.c.budget } : null,
+      budget: store.savedBudget,
       ui: { ...store.ui },
       server: Object.fromEntries(SERVER_FIELDS.map((f) => [f, store.server[f]])),
     },
@@ -84,16 +87,40 @@ export function importProfile(store, file, { password, mode = 'replace' } = {}) 
   const secrets = file.secrets && password ? open(file.secrets, password) : null;
   const cfg = file.config;
   store.transact(() => {
-    if (mode === 'replace') store.c.providers = [];
+    if (mode === 'replace') store.removeAllProviders();
     cfg.providers.forEach((p, i) => {
+      // Conta ou chave pausada no perfil de origem continua pausada.
+      const keepPaused = (providerId, k) => { if (!k.enabled) store.updateKey(providerId, store.provider(providerId).keys.at(-1).id, { enabled: false }); };
       const keys = secrets ? (p.keys ?? []).map((k, j) => ({ label: k.label, key: secrets.keys[`${i}:${j}`], enabled: k.enabled !== false })).filter((k) => k.key) : [];
+      if (p.type === 'oauth') {
+        // Provedores com conta: cada conta volta com os tokens que tinha (o acesso renova sozinho depois).
+        const added = store.addProvider({ ...p, keys: [], headers: secrets?.headers?.[i], models: p.models ?? [] });
+        keys.forEach((k) => {
+          try {
+            const cred = JSON.parse(k.key);
+            if (cred?.accessToken) { store.addOAuthAccount(added.id, cred); keepPaused(added.id, k); }
+          } catch { /* entrada corrompida: a conta é pulada */ }
+        });
+        return;
+      }
+      if (p.type === 'antigravity') {
+        // Contas Google voltam como credencial OAuth, não como chave de API.
+        const added = store.addProvider({ ...p, keys: [], headers: secrets?.headers?.[i], models: p.models ?? [] });
+        keys.forEach((k) => {
+          try {
+            const cred = JSON.parse(k.key);
+            if (cred?.refreshToken) { store.addCredential(added.id, { label: k.label, refreshToken: cred.refreshToken, projectId: cred.projectId ?? '', email: cred.email ?? null }); keepPaused(added.id, k); }
+          } catch { /* entrada corrompida: a conta é pulada */ }
+        });
+        return;
+      }
       const added = store.addProvider({ ...p, keys: keys.map(({ label, key }) => ({ label, key })), headers: secrets?.headers?.[i], models: p.models ?? [] });
       // chaves pausadas no perfil de origem continuam pausadas
       keys.forEach((k, j) => { if (!k.enabled) store.updateKey(added.id, added.keys[j].id, { enabled: false }); });
     });
     if (mode === 'replace') {
       if (cfg.routing) store.updateRouting(cfg.routing);
-      store.c.budget = null;
+      store.resetBudget();
       if (cfg.budget) store.updateBudget(cfg.budget);
       if (cfg.ui) store.updateUi(cfg.ui);
       if (cfg.server) store.updateServer(Object.fromEntries(SERVER_FIELDS.filter((f) => cfg.server[f] !== undefined).map((f) => [f, cfg.server[f]])));

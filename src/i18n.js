@@ -4,29 +4,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { CODES, detect, fill } from '../public/langs.js';
+
+export { CODES, detect };
 
 const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public', 'i18n');
-export const CODES = ['pt-BR', 'en', 'es', 'zh-CN', 'ja', 'ko', 'de', 'fr'];
-export const FALLBACK = 'en';
 
-/** Primeiro idioma da lista que o Rotaz tem; sem nenhum, inglês. */
-export function detect(list) {
-  for (const raw of list ?? []) {
-    const tag = String(raw || '').toLowerCase().replace('_', '-');
-    const base = tag.split('-')[0];
-    if (base === 'pt') return 'pt-BR';
-    if (base === 'zh') return 'zh-CN';
-    const hit = CODES.find((c) => c.toLowerCase() === tag || c.toLowerCase() === base);
-    if (hit) return hit;
-  }
-  return FALLBACK;
-}
-
-/** Idioma do sistema operacional, como o Node o vê. */
-export const systemLang = () => detect([process.env.ROTAZ_LANG, Intl.DateTimeFormat().resolvedOptions().locale, process.env.LANG].filter(Boolean));
+/** Idioma do sistema operacional, como o Node o vê. O do sistema não muda com o processo rodando; ROTAZ_LANG o app define na partida. */
+const osLocale = Intl.DateTimeFormat().resolvedOptions().locale;
+export const systemLang = () => detect([process.env.ROTAZ_LANG, osLocale, process.env.LANG].filter(Boolean));
 
 /** Preferência salva ('auto' ou um código) para o idioma efetivo. */
-export const resolveLang = (pref, system = systemLang) => (CODES.includes(pref) ? pref : typeof system === 'function' ? system() : system);
+export const resolveLang = (pref) => (CODES.includes(pref) ? pref : systemLang());
 
 const cache = new Map();
 function dict(lang) {
@@ -36,8 +25,6 @@ function dict(lang) {
   }
   return cache.get(lang);
 }
-
-const fill = (s, args) => s.replace(/\{(\d+)\}/g, (m, i) => (args[i] === undefined ? m : String(args[i])));
 
 /** Marca um texto fixo como chave de tradução (para a extração), sem traduzir aqui. */
 export const K = (s) => s;
@@ -50,7 +37,6 @@ export class LocalError extends Error {
     this.args = args;
   }
 }
-export const E = (key, ...args) => new LocalError(key, ...args);
 /** Mensagem com chave e argumentos, para dados (resultado de teste) e não para erros. */
 export const M = (key, ...args) => ({ k: key, a: args });
 
@@ -64,9 +50,6 @@ export function tr(lang, x) {
   if (typeof x === 'object' && 'k' in x) return fill(d[x.k] ?? x.k, (x.a ?? []).map(arg));
   return typeof x === 'string' ? d[x] ?? x : x;
 }
-
-/** Texto em português de uma mensagem {k, a} ou de um texto comum. */
-export const plain = (x) => (x && typeof x === 'object' && 'k' in x ? fill(x.k, (x.a ?? []).map(plain)) : x);
 
 /** Traduz os campos de texto de um resultado de teste (rótulo, mensagem, passos). */
 export function localizeTest(lang, r) {

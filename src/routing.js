@@ -66,6 +66,20 @@ export function buildRoute(store, requested) {
 }
 
 /**
+ * Espera `ms` ou até `signal` cancelar (erro com kind 'aborted'). O listener sai ao terminar: numa fila longa,
+ * a espera é feita em fatias de 1 s, e cada fatia deixava um listener preso no sinal da requisição.
+ */
+export function abortableSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const aborted = () => { const e = new Error('cancelado'); e.kind = 'aborted'; return e; };
+    if (signal?.aborted) { reject(aborted()); return; }
+    const onAbort = () => { clearTimeout(t); reject(aborted()); };
+    const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
  * Fila por provedor: respeita o limite de requisições por minuto configurado e as pausas pedidas
  * pelo próprio provedor (429). Quem chega espera a vez em vez de receber erro.
  */
@@ -95,10 +109,7 @@ export class ProviderGate {
         e.kind = 'queue';
         throw e;
       }
-      await new Promise((resolve, reject) => {
-        const t = setTimeout(resolve, Math.min(wait, 1000));
-        signal?.addEventListener('abort', () => { clearTimeout(t); const e = new Error('cancelado'); e.kind = 'aborted'; reject(e); }, { once: true });
-      });
+      await abortableSleep(Math.min(wait, 1000), signal);
     }
   }
 

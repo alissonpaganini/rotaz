@@ -1,0 +1,20 @@
+/* Página de retorno do login com a conta Google (src/admin.js, oauthPage). Só tokens de style.css. */
+.oauth-result {
+  box-sizing: border-box;
+  min-height: 100vh;
+  max-width: 440px;
+  margin: 0 auto;
+  padding: var(--s-7) var(--s-4);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--s-2);
+  text-align: center;
+  font-family: var(--font);
+  color: var(--ink);
+}
+.oauth-result h1 { margin: 0; }
+.oauth-result.ok h1 { color: var(--pos); }
+.oauth-result.bad h1 { color: var(--neg); }
+.oauth-result p { margin: 0; color: var(--ink-2); }
+.oauth-result .oauth-hint { margin-top: var(--s-4); color: var(--ink-3); }

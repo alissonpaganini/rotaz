@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Vault, loadMasterKey, randomToken } from './crypto.js';
+import { Vault, loadMasterKey } from './crypto.js';
 import { Store } from './store.js';
 import { Metrics } from './metrics.js';
 import { Budget } from './budget.js';
@@ -25,8 +25,7 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const { key, source } = loadMasterKey(dataDir);
   const store = new Store(dataDir, new Vault(key));
-  if (host) store.server.host = host;
-  if (port !== undefined) store.server.port = port;
+  store.override({ host: host || undefined, port });
 
   const log = createLogger(dataDir, () => store.server.logLevel, { console: !quiet });
   const metrics = new Metrics(path.join(dataDir, 'stats.json'));
@@ -34,16 +33,9 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
   const budget = new Budget(store, metrics);
   const gateway = createGateway({ store, metrics, log, limiter, budget });
 
-  let setupToken = null;
-  if (!store.c.admin.passHash) {
-    setupToken = randomToken(18);
-    fs.writeFileSync(path.join(dataDir, 'setup-token.txt'), setupToken, { mode: 0o600 });
-  }
-
   let server;
-  const admin = createAdmin({ store, metrics, log, limiter, gateway, budget, setupToken, dataDir, onRebind: () => rebind() });
-  admin.state.masterKeySource = keySourceName ?? source;
-  admin.state.desktop = desktop;
+  const admin = createAdmin({ store, metrics, log, limiter, gateway, budget, dataDir, masterKeySource: keySourceName ?? source, desktop,
+    onRebind: (prev) => rebind(prev).catch((e) => log.error(`não foi possível voltar a escutar: ${e.stack ?? e.message}`)) });
 
   const onRequest = async (req, res) => {
     let url;
@@ -83,11 +75,19 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
     });
   });
 
-  async function rebind() {
+  /** Troca de endereço pelo painel. Se o novo não abrir, volta ao anterior (`prev`), que acabou de ser liberado. */
+  async function rebind(prev) {
     const old = server;
     old.closeIdleConnections();
     await new Promise((r) => { old.close(r); setTimeout(() => { old.closeAllConnections(); r(); }, 1000); });
-    await listen();
+    try { await listen(); }
+    catch (e) {
+      if (!prev) throw e;
+      log.error(`não foi possível escutar em ${store.server.host}:${store.server.port} (${e.code ?? e.message}); voltando para ${prev.host}:${prev.port}`);
+      // Sem validar de novo: o endereço anterior já estava em uso (e pode ter vindo da linha de comando, fora dos limites do painel).
+      store.update((c) => { c.server.host = prev.host; c.server.port = prev.port; });
+      await listen();
+    }
     log.info(`escutando em ${store.server.host}:${store.server.port}`);
   }
 
@@ -100,7 +100,7 @@ export function createServer({ dataDir, host, port, quiet = false, desktop = fal
     await log.close();
   };
 
-  return { store, metrics, budget, log, gateway, listen, close, setupToken, keySource: source };
+  return { store, metrics, budget, log, gateway, listen, close, keySource: source, setupFile: admin.setupFile, get setupToken() { return admin.setupToken(); } };
 }
 
 function openBrowser(url) {
@@ -128,7 +128,7 @@ async function main() {
   const panel = `http://${shown}:${port}/`;
   app.log.info(`Rotaz em ${panel} (chave mestra: ${app.keySource})`);
   migrateAutoStart(app.store.server.autoStart, dataDir);
-  if (app.setupToken) console.log(`\nPrimeiro acesso: abra ${panel}#setup=${app.setupToken}\nO código também está em ${path.join(dataDir, 'setup-token.txt')}\n`);
+  if (app.setupToken) console.log(`\nPrimeiro acesso: abra ${panel}#setup=${app.setupToken}\nO código também está em ${app.setupFile}\n`);
   if (process.argv.includes('--open')) openBrowser(app.setupToken ? `${panel}#setup=${app.setupToken}` : panel);
 
   const stop = async () => { await app.close(); process.exit(0); };

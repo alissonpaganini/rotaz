@@ -1,10 +1,13 @@
 // Persistência em JSON com escrita atômica. Segredos ficam cifrados; o arquivo nunca guarda texto claro.
 import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
-import { shortId, randomToken, sha256 } from './crypto.js';
+import { shortId, randomToken, sha256, hashPassword, verifyPassword } from './crypto.js';
 import { ALIAS_RE, validateBaseUrl, validateHeaders, aliasCompat } from './security.js';
 import { LocalError, CODES } from './i18n.js';
 import { BUDGET_DEFAULTS, CURRENCIES, ACTIONS } from './budget.js';
+import { specOf } from './providers/oauth/specs.js';
 
 export const DEFAULTS = {
   version: 1,
@@ -52,8 +55,13 @@ const clampInt = (v, min, max, name) => {
   return n;
 };
 
-export class Store {
+/** Configuração em disco. Emite 'change' depois de cada alteração gravada. */
+export class Store extends EventEmitter {
+  #aliases = null;
+  #headers = new Map(); // headersEnc -> cabeçalhos decifrados
+
   constructor(dataDir, vault) {
+    super();
     this.dataDir = dataDir;
     this.vault = vault;
     this.file = path.join(dataDir, 'config.json');
@@ -78,9 +86,23 @@ export class Store {
     if (!exists) this.save();
   }
 
+  /**
+   * Endereço vindo da linha de comando (--host, --port, ROTAZ_PORT): vale nesta execução, mas o arquivo continua
+   * com o que foi salvo pelo painel. Antes, a primeira alteração qualquer gravava a porta temporária (até a 0).
+   */
+  override({ host, port } = {}) {
+    for (const [k, v] of [['host', host], ['port', port]]) {
+      if (v === undefined) continue;
+      this.saved ??= {};
+      if (!(k in this.saved)) this.saved[k] = this.c.server[k];
+      this.c.server[k] = v;
+    }
+  }
+
   save() {
     const tmp = `${this.file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.c, null, 2), { mode: 0o600 });
+    const data = this.saved ? { ...this.c, server: { ...this.c.server, ...this.saved } } : this.c;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
     // No Windows, antivírus e indexador seguram o arquivo por instantes: o rename falha com EPERM/EBUSY.
     for (let i = 0; ; i++) {
       try { fs.renameSync(tmp, this.file); return; } catch (e) {
@@ -101,15 +123,17 @@ export class Store {
     if (this.inTx) return fn();
     const snapshot = structuredClone(this.c);
     this.inTx = true;
+    let r;
     try {
-      const r = fn();
+      r = fn();
       this.save();
-      return r;
     } catch (e) {
       this.c = snapshot;
       this.cacheToken();
       throw e;
-    } finally { this.inTx = false; }
+    } finally { this.inTx = false; this.#aliases = null; }
+    this.emit('change');
+    return r;
   }
 
   /** Alterações administrativas (senha etc.), com o mesmo rollback. */
@@ -125,6 +149,13 @@ export class Store {
     });
   }
   cacheToken() { this.tokenHash = sha256(this.gatewayToken()); }
+  /** O token apresentado pelo Claude Code confere com o do gateway (comparação em tempo constante). */
+  checkGatewayToken(presented) { return !!presented && timingSafeEqual(sha256(presented), this.tokenHash); }
+
+  // Senha do painel.
+  get hasPassword() { return !!this.c.admin.passHash; }
+  checkPassword(password) { return this.hasPassword && verifyPassword(String(password ?? ''), this.c.admin.passHash); }
+  setPassword(password) { this.transact(() => { this.c.admin.passHash = hashPassword(password); }); }
   gatewayToken() { return this.vault.decrypt(this.c.gateway.tokenEnc, 'gateway-token'); }
 
   get server() { return this.c.server; }
@@ -141,25 +172,45 @@ export class Store {
     if (lang !== 'auto' && !CODES.includes(lang)) throw new Error('Idioma inválido.');
     let dashboard = this.ui.dashboard ?? null;
     if (input.dashboard !== undefined) dashboard = input.dashboard === null ? null : normalizeDashboard(input.dashboard);
-    this.transact(() => { this.c.ui = { theme, palette, lang, dashboard }; });
+    // Última versão cujas novidades a pessoa já viu (o painel mostra as da versão nova uma vez, depois de atualizar).
+    let seenVersion = this.ui.seenVersion ?? null;
+    if (input.seenVersion !== undefined && input.seenVersion !== null) {
+      if (!/^\d{1,4}\.\d{1,4}\.\d{1,6}$/.test(String(input.seenVersion))) throw new Error('Versão inválida.');
+      seenVersion = String(input.seenVersion);
+    }
+    this.transact(() => { this.c.ui = { theme, palette, lang, dashboard, seenVersion }; });
     return this.c.ui;
   }
   get providers() { return this.c.providers; }
+  removeAllProviders() { this.transact(() => { this.c.providers = []; }); }
   provider(id) { return this.c.providers.find((p) => p.id === id); }
 
-  // ---- provedores ----
   normalizeProvider(input, existing) {
     const name = String(input.name ?? existing?.name ?? '').trim();
     if (!name || name.length > 60) throw new Error('Informe um nome de até 60 caracteres.');
     const type = input.type ?? existing?.type ?? 'openai';
-    if (!['openai', 'anthropic'].includes(type)) throw new Error('Tipo de provedor inválido.');
+    if (!['openai', 'anthropic', 'antigravity', 'oauth'].includes(type)) throw new Error('Tipo de provedor inválido.');
+    // oauth: qual ficha de provedor com conta (src/providers/oauth/specs.js) este provedor usa.
+    const oauth = type === 'oauth' ? String(input.oauth ?? existing?.oauth ?? '') : null;
+    const spec = type === 'oauth' ? specOf(oauth) : null;
+    if (type === 'oauth' && !spec) throw new LocalError('Provedor de conta desconhecido: {0}', oauth.slice(0, 40));
     const allowPrivateNetwork = !!(input.allowPrivateNetwork ?? existing?.allowPrivateNetwork);
-    const baseUrl = validateBaseUrl(input.baseUrl ?? existing?.baseUrl, { allowPrivate: allowPrivateNetwork, selfPort: this.server.port });
-    const authScheme = input.authScheme ?? existing?.authScheme ?? (type === 'anthropic' ? 'x-api-key' : 'bearer');
+    // Provedores com conta não têm URL base configurável: o endpoint é fixo e a credencial vem do OAuth.
+    const baseUrl = type === 'antigravity'
+      ? 'https://daily-cloudcode-pa.googleapis.com'
+      : type === 'oauth' ? spec.chatUrl
+      : validateBaseUrl(input.baseUrl ?? existing?.baseUrl, { allowPrivate: allowPrivateNetwork, selfPort: this.server.port });
+    const authScheme = type === 'antigravity' || type === 'oauth'
+      ? 'bearer'
+      : input.authScheme ?? existing?.authScheme ?? (type === 'anthropic' ? 'x-api-key' : 'bearer');
     if (!['bearer', 'x-api-key', 'api-key', 'none'].includes(authScheme)) throw new Error('Esquema de autenticação inválido.');
+    // GitHub Enterprise e afins: o login e a API ficam no servidor da empresa, informado pela pessoa.
+    const accountHost = spec?.needsHost
+      ? validateBaseUrl(input.accountHost ?? existing?.accountHost ?? '', { allowPrivate: allowPrivateNetwork, selfPort: this.server.port }).replace(/\/+$/, '')
+      : null;
     return {
-      id: existing?.id ?? shortId(), name, type, baseUrl, authScheme, allowPrivateNetwork,
-      enabled: input.enabled ?? existing?.enabled ?? true,
+      id: existing?.id ?? shortId(), name, type, ...(oauth && { oauth }), ...(accountHost && { accountHost }), baseUrl, authScheme, allowPrivateNetwork,
+      enabled: !!(input.enabled ?? existing?.enabled ?? true),
       priority: clampInt(input.priority ?? existing?.priority ?? 10, 0, 1000, 'Prioridade'),
       rpm: clampInt(input.rpm ?? existing?.rpm ?? 0, 0, 100000, 'Limite de requisições por minuto'),
       presetId: /^[a-z0-9-]{1,40}$/.test(input.presetId ?? '') ? input.presetId : existing?.presetId ?? null,
@@ -203,9 +254,18 @@ export class Store {
     const clean = validateHeaders(headers);
     p.headersEnc = Object.keys(clean).length ? this.vault.encrypt(JSON.stringify(clean), `headers:${p.id}`) : null;
   }
-  headersOf(p) { return p.headersEnc ? JSON.parse(this.vault.decrypt(p.headersEnc, `headers:${p.id}`)) : {}; }
+  /** Cabeçalhos extras do provedor, decifrados uma vez por versão (o gateway lê a cada pedido). */
+  headersOf(p) {
+    if (!p.headersEnc) return {};
+    let h = this.#headers.get(p.headersEnc);
+    if (!h) {
+      h = Object.freeze(JSON.parse(this.vault.decrypt(p.headersEnc, `headers:${p.id}`)));
+      if (this.#headers.size > 200) this.#headers.clear();
+      this.#headers.set(p.headersEnc, h);
+    }
+    return h;
+  }
 
-  // ---- chaves ----
   addKey(providerId, input) { return this.transact(() => this.#addKey(providerId, input)); }
   #addKey(providerId, { label, key }) {
     const p = this.provider(providerId);
@@ -234,7 +294,85 @@ export class Store {
     });
   }
 
-  // ---- modelos ----
+  // ---- credenciais OAuth (antigravity) ----
+  /**
+   * Uma conta Google é guardada como um item de `keys`, para o rodízio de contas reaproveitar o
+   * KeyPool que já existe. O que fica cifrado é o refresh_token + projectId + email.
+   */
+  addCredential(providerId, { label, refreshToken, projectId, email }) {
+    return this.transact(() => {
+      const p = this.provider(providerId);
+      if (!p) throw new Error('Provedor não encontrado.');
+      if (p.type !== 'antigravity') throw new Error('Este provedor não usa conta OAuth.');
+      const rt = String(refreshToken ?? '').trim();
+      if (!rt || rt.length > 4096 || /[\r\n\s]/.test(rt)) throw new Error('Refresh token inválido.');
+      const id = shortId();
+      const name = String(label ?? '').trim().slice(0, 40) || email || `Conta ${p.keys.length + 1}`;
+      p.keys.push({
+        id, label: name.slice(0, 40), enabled: true,
+        hint: email ? `…${email.split('@')[0].slice(-6)}@${email.split('@')[1] ?? ''}`.slice(0, 40) : '…oauth',
+        enc: this.vault.encrypt(JSON.stringify({ refreshToken: rt, projectId: String(projectId ?? ''), email: email ?? null }), `oauth:${p.id}:${id}`),
+        accessEnc: null, expiresAt: 0, addedAt: Date.now(),
+      });
+      return id;
+    });
+  }
+
+  // ---- contas de provedores OAuth genéricos (src/providers/oauth) ----
+  /** Guarda uma conta conectada: tokens e dados do provedor ficam cifrados num pacote só. Devolve o e-mail. */
+  addOAuthAccount(providerId, cred) {
+    return this.transact(() => {
+      const p = this.provider(providerId);
+      if (!p || p.type !== 'oauth') throw new Error('Este provedor não usa conta OAuth.');
+      const token = String(cred?.accessToken ?? '');
+      if (!token || token.length > 16384) throw new Error('Token de acesso inválido.');
+      const id = shortId();
+      const email = cred.email ? String(cred.email).slice(0, 120) : null;
+      p.keys.push({ id, label: (email || cred.name || `Conta ${p.keys.length + 1}`).slice(0, 40), enabled: true,
+        hint: email ? `…${email.split('@')[0].slice(-6)}${email.includes('@') ? `@${email.split('@')[1]}` : ''}`.slice(0, 40) : '…oauth',
+        enc: this.vault.encrypt(JSON.stringify({ ...cred, email }), `oauthx:${p.id}:${id}`), addedAt: Date.now() });
+      return email;
+    });
+  }
+  oauthAccount(provider, keyRecord) {
+    if (!keyRecord?.enc) return null;
+    try { return JSON.parse(this.vault.decrypt(keyRecord.enc, `oauthx:${provider.id}:${keyRecord.id}`)); } catch { return null; }
+  }
+  saveOAuthAccount(providerId, keyId, cred) {
+    const p = this.provider(providerId);
+    const k = p?.keys.find((x) => x.id === keyId);
+    if (!p || !k) return;
+    this.transact(() => { k.enc = this.vault.encrypt(JSON.stringify(cred), `oauthx:${p.id}:${k.id}`); });
+  }
+
+  credentialOf(provider, keyRecord) {
+    if (!keyRecord?.enc) return null;
+    try { return JSON.parse(this.vault.decrypt(keyRecord.enc, `oauth:${provider.id}:${keyRecord.id}`)); } catch { return null; }
+  }
+
+  /** Grava o resultado do refresh: token novo, eventual refresh_token rotacionado e projectId. */
+  saveCredential(providerId, keyId, { refreshToken, projectId, email, accessToken, expiresAt }) {
+    const p = this.provider(providerId);
+    const k = p?.keys.find((x) => x.id === keyId);
+    if (!p || !k) return;
+    this.transact(() => {
+      k.enc = this.vault.encrypt(JSON.stringify({ refreshToken, projectId: projectId ?? '', email: email ?? null }), `oauth:${p.id}:${k.id}`);
+      k.accessEnc = accessToken ? this.vault.encrypt(accessToken, `access:${p.id}:${k.id}`) : null;
+      k.expiresAt = Number(expiresAt) || 0;
+      if (email) k.label = k.label.includes('@') || /^Conta \d+$/.test(k.label) ? String(email).slice(0, 40) : k.label;
+    });
+  }
+
+  /** Limpa o cache de access token: força o próximo request a renovar. */
+  forgetAccessToken(provider, keyRecord) {
+    this.transact(() => {
+      const k = this.provider(provider.id)?.keys.find((x) => x.id === keyRecord.id);
+      if (!k) return;
+      k.accessEnc = null;
+      k.expiresAt = 0;
+    });
+  }
+
   upsertModel(providerId, input) { return this.transact(() => this.#upsertModel(providerId, input)); }
   #upsertModel(providerId, input) {
     const p = this.provider(providerId);
@@ -256,8 +394,11 @@ export class Store {
     const price = (v, name) => (v === null || v === undefined || v === '' ? null : clampNum(v, 0, 10000, name));
     const priceIn = price(input.priceIn, 'Preço de entrada');
     const priceOut = price(input.priceOut, 'Preço de saída');
+    // Contexto do modelo em tokens (ex.: 1.000.000). Ausente no pedido = mantém o que já estava (vem do catálogo do provedor).
+    const ctxIn = 'contextWindow' in input ? input.contextWindow : existing?.contextWindow;
+    const contextWindow = ctxIn === null || ctxIn === undefined || ctxIn === '' ? null : clampInt(ctxIn, 1000, 10000000, 'Contexto');
     const m = { id: existing?.id ?? shortId(), alias, upstream, displayName: String(input.displayName ?? '').trim().slice(0, 80) || alias,
-      enabled: input.enabled ?? existing?.enabled ?? true, maxOutputTokens, maxImages, reasoningEffort: effort, tokenParam, priceIn, priceOut };
+      enabled: !!(input.enabled ?? existing?.enabled ?? true), maxOutputTokens, maxImages, reasoningEffort: effort, tokenParam, priceIn, priceOut, contextWindow };
     const oldAlias = existing && existing.alias !== alias ? existing.alias : null;
     if (existing) Object.assign(existing, m); else p.models.push(m);
     // Renomear leva junto as referências (padrão, níveis, reserva do orçamento) se nenhum outro modelo usa o nome antigo.
@@ -272,7 +413,7 @@ export class Store {
     if (list.length > 500) throw new Error('No máximo 500 modelos por vez.');
     return this.transact(() => list.map((m) => {
       try {
-        return this.#upsertModel(providerId, { alias: m.alias, upstream: m.upstream, displayName: m.displayName, maxOutputTokens: m.maxOutputTokens, maxImages: m.maxImages, reasoningEffort: m.reasoningEffort, tokenParam: m.tokenParam, priceIn: m.priceIn, priceOut: m.priceOut });
+        return this.#upsertModel(providerId, { alias: m.alias, upstream: m.upstream, displayName: m.displayName, maxOutputTokens: m.maxOutputTokens, maxImages: m.maxImages, reasoningEffort: m.reasoningEffort, tokenParam: m.tokenParam, priceIn: m.priceIn, priceOut: m.priceOut, contextWindow: m.contextWindow ?? null });
       } catch (e) { throw new LocalError('{0}: {1}', String(m.alias || m.upstream).slice(0, 80), e); }
     }));
   }
@@ -282,7 +423,7 @@ export class Store {
     const p = this.provider(providerId);
     if (!p) throw new Error('Provedor não encontrado.');
     if (!Array.isArray(ids) || !ids.length) throw new Error('Selecione ao menos um modelo.');
-    const fields = ['enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam', 'priceIn', 'priceOut'].filter((f) => f in set);
+    const fields = ['enabled', 'maxOutputTokens', 'maxImages', 'reasoningEffort', 'tokenParam', 'priceIn', 'priceOut', 'contextWindow'].filter((f) => f in set);
     if (!fields.length) throw new Error('Nada para alterar.');
     this.transact(() => {
       for (const id of ids) {
@@ -314,7 +455,12 @@ export class Store {
     });
   }
 
-  aliases() { return [...new Set(this.c.providers.flatMap((p) => p.models.map((m) => m.alias)))]; }
+  /** Aliases cadastrados. Fora de uma alteração, calculado uma vez até a próxima mudança (o roteamento lê a cada pedido). */
+  aliases() {
+    const compute = () => [...new Set(this.c.providers.flatMap((p) => p.models.map((m) => m.alias)))];
+    if (this.inTx) return compute();
+    return (this.#aliases ??= compute());
+  }
   #renameRoutes(from, to) {
     const r = this.routing;
     if (r.defaultAlias === from) r.defaultAlias = to;
@@ -334,7 +480,6 @@ export class Store {
 
   // ---- configurações ----
   updateRouting(input) {
-    // Valida tudo antes de mudar qualquer coisa.
     const all = new Set(this.aliases());
     const check = (a) => { if (a && !all.has(a)) throw new LocalError('Alias desconhecido: {0}', String(a).slice(0, 70)); return a || null; };
     const next = structuredClone(this.routing);
@@ -346,6 +491,9 @@ export class Store {
   }
 
   get budget() { return { ...BUDGET_DEFAULTS, ...this.c.budget }; }
+  /** Orçamento como gravado (null quando nunca foi configurado), para o backup. */
+  get savedBudget() { return this.c.budget ? { ...this.c.budget } : null; }
+  resetBudget() { this.transact(() => { this.c.budget = null; }); }
   updateBudget(input) {
     const b = this.budget;
     const next = { ...b };
@@ -392,14 +540,22 @@ export class Store {
     if (input.openBrowser !== undefined) next.openBrowser = !!input.openBrowser;
     if (input.gatewayEnabled !== undefined) next.gatewayEnabled = !!input.gatewayEnabled;
     if (input.updateCheck !== undefined) next.updateCheck = !!input.updateCheck;
-    this.transact(() => { Object.assign(this.c.server, next); });
+    // Endereço da linha de comando só passa a ser gravado quando o painel muda esse campo de fato.
+    const kept = this.saved && { ...this.saved };
+    const changed = ['host', 'port'].filter((k) => next[k] !== s[k]);
+    try {
+      this.transact(() => {
+        Object.assign(this.c.server, next);
+        for (const k of changed) if (this.saved) delete this.saved[k];
+      });
+    } catch (e) { if (kept) this.saved = kept; throw e; }
   }
 
   /** Visão segura para o navegador: nenhum segredo sai daqui. */
   publicProviders() {
     return this.c.providers.map((p) => ({
       id: p.id, name: p.name, type: p.type, baseUrl: p.baseUrl, authScheme: p.authScheme, enabled: p.enabled, priority: p.priority,
-      allowPrivateNetwork: p.allowPrivateNetwork, rpm: p.rpm ?? 0, presetId: p.presetId ?? null,
+      allowPrivateNetwork: p.allowPrivateNetwork, rpm: p.rpm ?? 0, presetId: p.presetId ?? null, oauth: p.oauth ?? null, accountHost: p.accountHost ?? null,
       headerNames: Object.keys(this.headersOf(p)),
       keys: p.keys.map(({ id, label, enabled, hint, addedAt }) => ({ id, label, enabled, hint, addedAt })),
       models: p.models.map((m) => ({ ...m, compat: aliasCompat(m.alias) })),

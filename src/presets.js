@@ -4,9 +4,11 @@
 // `urlPlaceholder`: a URL tem uma parte que o usuário precisa trocar (recurso, conta).
 // K() marca os textos que o painel traduz (nomes de grupo, avisos).
 import { K } from './i18n.js';
+import { SPECS } from './providers/oauth/specs.js';
 
 export const CATEGORIES = [
   { id: 'main', name: K('Principais') },
+  { id: 'account', name: K('Entrar com a conta') },
   { id: 'fast', name: K('Inferência e nuvem') },
   { id: 'aggregator', name: K('Agregadores') },
   { id: 'asia', name: K('China e Ásia') },
@@ -18,11 +20,28 @@ export const CATEGORIES = [
 const local = { authScheme: 'none', allowPrivateNetwork: true, category: 'local' };
 const anth = { type: 'anthropic', authScheme: 'x-api-key', category: 'anthropic' };
 
+/** Provedores com conta (src/providers/oauth): login no navegador ou por código, sem chave de API. */
+const ACCOUNT_ICONS = { github: 'github', 'ghe-copilot': 'github', 'kimi-coding': 'kimi', 'xai-oauth': 'xai', 'grok-cli': 'xai', codex: 'openai', chatgpt: 'openai', cline: 'cline', clinepass: 'cline', kilocode: 'kilocode', workbuddy: 'workbuddy', deepseek: 'deepseek' };
+const ACCOUNT_ALIASES = { github: 'claude-copilot', 'kimi-coding': 'claude-kimi-code', 'xai-oauth': 'claude-grok-conta', openference: 'claude-openference', kilocode: 'claude-kilo', cline: 'claude-cline', clinepass: 'claude-clinepass', deepseek: 'claude-deepseek-conta' };
+/**
+ * Fora do catálogo: quem já cadastrou continua usando (o código fica em src/providers/oauth), mas ninguém novo os vê.
+ * Openference, CodeBuddy e Muse Code exigem coisas que quase ninguém tem; o Freebuff suspende contas usadas fora dos
+ * clientes oficiais.
+ */
+const HIDDEN_ACCOUNTS = new Set(['openference', 'codebuddy-cn', 'codebuddy-intl', 'muse-code', 'freebuff']);
+/** Só funcionam com um plano pago ativo na conta: o login passa, mas os pedidos são recusados sem ele. */
+const PAID_ACCOUNTS = new Set(['xai-oauth', 'kimi-coding', 'chatgpt', 'clinepass', 'codex']);
+const accountPresets = () => Object.entries(SPECS).filter(([id]) => !HIDDEN_ACCOUNTS.has(id)).map(([id, sp]) => ({
+  id: `account-${id}`, name: sp.name, category: 'account', type: 'oauth', oauth: id, baseUrl: sp.chatUrl, icon: ACCOUNT_ICONS[id], site: sp.site,
+  alias: ACCOUNT_ALIASES[id] ?? `claude-${id}`, note: sp.note, risk: sp.risk, account: true, ...(sp.needsHost && { needsHost: true }), ...(PAID_ACCOUNTS.has(id) && { paid: true }),
+}));
+
 export const PRESETS = [
   // Principais
   { id: 'openai', name: 'OpenAI', category: 'main', type: 'openai', baseUrl: 'https://api.openai.com/v1', icon: 'openai', keyUrl: 'https://platform.openai.com/api-keys', alias: 'claude-gpt' },
   { id: 'anthropic', name: 'Anthropic', category: 'main', type: 'anthropic', baseUrl: 'https://api.anthropic.com', authScheme: 'x-api-key', icon: 'anthropic', keyUrl: 'https://console.anthropic.com/settings/keys', alias: 'claude-anthropic' },
   { id: 'gemini', name: 'Google Gemini', category: 'main', type: 'openai', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', icon: 'gemini', keyUrl: 'https://aistudio.google.com/apikey', alias: 'claude-gemini' },
+  { id: 'antigravity', name: 'Google Antigravity', category: 'account', type: 'antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com', icon: 'gemini', oauth: true, alias: 'claude-antigravity', note: K('Usa a sua conta Google paga (One AI Pro) pelo backend do Antigravity — sem chave de API. Depois de adicionar, conecte a conta Google no detalhe do provedor.') },
   { id: 'deepseek', name: 'DeepSeek', category: 'main', type: 'openai', baseUrl: 'https://api.deepseek.com/v1', icon: 'deepseek', keyUrl: 'https://platform.deepseek.com/api_keys', alias: 'claude-deepseek' },
   { id: 'xai', name: 'xAI Grok', category: 'main', type: 'openai', baseUrl: 'https://api.x.ai/v1', icon: 'xai', keyUrl: 'https://console.x.ai', alias: 'claude-grok' },
   { id: 'mistral', name: 'Mistral', category: 'main', type: 'openai', baseUrl: 'https://api.mistral.ai/v1', icon: 'mistral', keyUrl: 'https://console.mistral.ai/api-keys', alias: 'claude-mistral' },
@@ -81,4 +100,5 @@ export const PRESETS = [
   // Personalizado
   { id: 'custom', name: K('Compatível com OpenAI'), category: 'custom', type: 'openai', baseUrl: '', alias: 'claude-custom' },
   { id: 'custom-anthropic', name: K('Compatível com Anthropic'), category: 'custom', type: 'anthropic', authScheme: 'x-api-key', baseUrl: '', alias: 'claude-custom-a' },
+  ...accountPresets(),
 ];

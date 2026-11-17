@@ -57,7 +57,7 @@ export function validateBaseUrl(raw, { allowPrivate = false, selfPort } = {}) {
     throw new Error('Host local bloqueado pela proteção SSRF. Para redes locais, ative "Permitir rede local".');
   }
   if (u.protocol === 'http:' && !allowPrivate) throw new Error('Use https. Http só é aceito com "Permitir rede local" ativo.');
-  if (selfPort && isLoopbackHost(host) && Number(u.port || 80) === Number(selfPort)) throw new Error('A URL base não pode apontar para o próprio gateway.');
+  if (selfPort && isLoopbackHost(host) && Number(u.port || (u.protocol === 'https:' ? 443 : 80)) === Number(selfPort)) throw new Error('A URL base não pode apontar para o próprio gateway.');
   return u.toString().replace(/\/+$/, '');
 }
 
