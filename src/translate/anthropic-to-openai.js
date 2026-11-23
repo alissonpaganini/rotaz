@@ -126,7 +126,9 @@ export function anthropicRequestToOpenAI(body, t) {
   if (body.temperature !== undefined) payload.temperature = body.temperature;
   if (body.top_p !== undefined) payload.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) payload.stop = body.stop_sequences.slice(0, 4);
-  if (t.reasoningEffort) payload.reasoning_effort = t.reasoningEffort;
+  const rawEffort = typeof body.output_config?.effort === 'string' ? body.output_config.effort.trim().toLowerCase() : null;
+  const clientEffort = rawEffort === 'max' || rawEffort === 'ultracode' || rawEffort === 'xhigh' ? 'high' : rawEffort;
+  if (clientEffort || t.reasoningEffort) payload.reasoning_effort = clientEffort || t.reasoningEffort;
   // Claude Code envia um user_id longo e identificável; o provedor recebe apenas um hash estável.
   if (body.metadata?.user_id) payload.user = crypto.createHash('sha256').update(String(body.metadata.user_id)).digest('hex').slice(0, 32);
 

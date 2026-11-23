@@ -384,7 +384,7 @@ export class Store extends EventEmitter {
     const existing = input.id ? p.models.find((m) => m.id === input.id) : null;
     if (p.models.some((m) => m.alias === alias && m.id !== existing?.id)) throw new Error('Este alias já existe neste provedor.');
     const effort = input.reasoningEffort || null;
-    if (effort && !['minimal', 'low', 'medium', 'high'].includes(effort)) throw new Error('Esforço de raciocínio inválido.');
+    if (effort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) throw new Error('Esforço de raciocínio inválido.');
     const tokenParam = input.tokenParam || 'auto';
     if (!['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParam)) throw new Error('Parâmetro de tokens inválido.');
     const maxOutputTokens = input.maxOutputTokens ? clampInt(input.maxOutputTokens, 1, 2000000, 'Limite de saída') : null;

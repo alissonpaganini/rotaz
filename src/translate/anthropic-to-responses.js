@@ -76,8 +76,10 @@ export function anthropicRequestToResponses(body, t) {
     else payload.tool_choice = 'auto';
     payload.parallel_tool_calls = !tc?.disable_parallel_tool_use;
   }
-  const thinking = body.thinking?.type === 'enabled' || body.thinking?.type === 'adaptive';
-  const effort = t.reasoningEffort || (thinking ? 'medium' : null);
+  const rawEffort = typeof body.output_config?.effort === 'string' ? body.output_config.effort.trim().toLowerCase() : null;
+  const clientEffort = rawEffort === 'max' || rawEffort === 'ultracode' ? 'xhigh' : rawEffort;
+  const thinking = body.thinking?.type === 'enabled' || body.thinking?.type === 'adaptive' || !!clientEffort;
+  const effort = clientEffort || t.reasoningEffort || (thinking ? 'medium' : null);
   if (effort) payload.reasoning = { effort, summary: 'auto' };
   if (body.stream) payload.stream = true;
   return { payload, names, thinking };

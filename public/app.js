@@ -1538,9 +1538,10 @@ function aliasAssist(input, { upstream, taken, original, onPick } = {}) {
   return h('div', { class: 'alias-assist full' }, status, picks);
 }
 
-/** Esforço de raciocínio aceito pelos provedores OpenAI (reasoning_effort). */
-const EFFORTS = ['minimal', 'low', 'medium', 'high'];
+/** Esforço de raciocínio aceito pelos provedores OpenAI e Responses (reasoning_effort / reasoning.effort). */
+const EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const effortOptions = () => EFFORTS.map((v) => h('option', { value: v }, v));
+const supportsEffort = (p) => p.type === 'openai' || p.type === 'oauth';
 
 function modelDialog(p, m, isDefault = false, { alias: presetAlias } = {}) {
   const makeDefault = h('input', { type: 'checkbox', checked: isDefault, disabled: isDefault });
@@ -1578,7 +1579,7 @@ function modelDialog(p, m, isDefault = false, { alias: presetAlias } = {}) {
       field(L('Nome de exibição'), display), field(L('Limite de saída (tokens)'), maxOut, L('Reduz o max_tokens do Claude Code quando preciso.')),
       field(L('Contexto (tokens)'), context, L('Com 1 milhão ou mais, o Claude Code passa a usar a janela de 1M (no app Claude e no terminal). Abaixo disso, ele usa 200 mil.'), 'full'),
       field(L('Imagens'), images, m?.learnedMaxImages !== null && m?.learnedMaxImages !== undefined ? (m.learnedMaxImages === 0 ? L('Detectado pelo erro do provedor: não aceita imagens. Salvar substitui a detecção.') : L('Detectado pelo erro do provedor: no máximo {0}. Salvar substitui a detecção.', m.learnedMaxImages)) : L('Imagens acima do limite viram um aviso em texto; as mais recentes ficam.'), 'full'),
-      p.type === 'openai' && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
+      supportsEffort(p) && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
       field(L('Preço de entrada (US$ por 1M de tokens)'), priceIn), field(L('Preço de saída (US$ por 1M de tokens)'), priceOut),
       h('div', { class: 'hint full' }, L('Está na página de preços do provedor. Vazio, o gasto deste modelo não é contado; modelos locais custam 0.')),
       h('label', { class: 'check full' }, makeDefault, L('Usar como modelo padrão'))),
@@ -1885,14 +1886,14 @@ function bulkEditDialog(p, ids) {
     body: h('div', { class: 'form-grid' },
       field(L('Limite de saída (tokens)'), maxOut), h('label', { class: 'check' }, noLimit, L('Remover o limite')),
       field(L('Imagens'), images, null, 'full'),
-      p.type === 'openai' && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
+      supportsEffort(p) && field(L('Esforço de raciocínio'), effort), p.type === 'openai' && field(L('Parâmetro de tokens'), param),
       field(L('Preço de entrada (US$ por 1M de tokens)'), priceIn), field(L('Preço de saída (US$ por 1M de tokens)'), priceOut),
       field(L('Contexto (tokens)'), context, L('Com 1 milhão ou mais, o Claude Code passa a usar a janela de 1M (no app Claude e no terminal). Abaixo disso, ele usa 200 mil.'), 'full')),
     submit: async () => {
       const set = {};
       if (context.value !== '') set.contextWindow = Number(context.value);
       if (noLimit.checked) set.maxOutputTokens = null; else if (maxOut.value) set.maxOutputTokens = Number(maxOut.value);
-      if (p.type === 'openai' && effort.value !== 'keep') set.reasoningEffort = effort.value || null;
+      if (supportsEffort(p) && effort.value !== 'keep') set.reasoningEffort = effort.value || null;
       if (p.type === 'openai' && param.value !== 'keep') set.tokenParam = param.value;
       if (images.value !== 'keep') set.maxImages = images.value === '' ? null : Number(images.value);
       if (priceIn.value !== '') set.priceIn = Number(priceIn.value);
@@ -2065,7 +2066,7 @@ async function importDialog(p, refresh = false) {
           h('div', { class: 'field full' }, h('div', { class: 'lbl' }, L('Nomes dos aliases')), namingCtl,
             h('div', { class: 'hint' }, L('O seletor do Claude Desktop esconde nomes que citam outros fornecedores; no CLI, qualquer nome com "claude-" funciona.'))),
           field(L('Limite de saída para todos (tokens)'), maxOut, L('Opcional. Dá para ajustar depois, em massa.')),
-          p.type === 'openai' && field(L('Esforço de raciocínio para todos'), effort),
+          supportsEffort(p) && field(L('Esforço de raciocínio para todos'), effort),
           h('label', { class: 'check full' }, testAfter, L('Testar em seguida os que ainda não foram testados'))))),
     submit: async () => {
       stopTests();
