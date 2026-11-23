@@ -486,13 +486,6 @@ SPECS.chatgpt = {
     const out = { ...payload, model, store: false, stream: true };
     for (const k of SIWC_OMIT) delete out[k];
     if (effort) out.reasoning = { ...out.reasoning, effort, summary: 'auto' };
-    // Ferramentas do cliente vão como um item "additional_tools" no começo do input, como o SDK oficial faz.
-    if (Array.isArray(out.tools)) {
-      const own = out.tools.filter((t) => t.type === 'function' || t.type === 'custom');
-      out.tools = out.tools.filter((t) => t.type !== 'function' && t.type !== 'custom');
-      if (!out.tools.length) delete out.tools;
-      if (own.length) out.input = [{ type: 'additional_tools', tools: own }, ...(out.input ?? [])];
-    }
     return out;
   },
 };
